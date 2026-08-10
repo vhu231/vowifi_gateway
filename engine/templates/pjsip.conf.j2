@@ -183,13 +183,18 @@ max_contacts=3
 remove_existing=yes
 
 {% for acct in external_accounts %}
+{% if acct.username %}
+; Third-party SIP softphones (UDP/TCP/TLS). Pin transport-local so REGISTER never
+; competes with the WebRTC WSS transport (which would look like Unauthorized).
 [{{ acct.username }}](endpoint-local)
+transport=transport-local
 auth=auth-{{ acct.username }}
 aors={{ acct.username }}
 [auth-{{ acct.username }}](auth-local)
 username={{ acct.username }}
 password={{ acct.password }}
 [{{ acct.username }}](aor-local)
+{% endif %}
 {% endfor %}
 
 {% if webrtc_enable %}

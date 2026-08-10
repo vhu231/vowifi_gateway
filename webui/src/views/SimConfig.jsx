@@ -178,6 +178,18 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       // here; only then do we forward it to update the saved credential.
       delete body.pin
       if (pin) body.pin = pin
+      // Same for external SIP passwords: omit blank fields so the server keeps the stored
+      // secret. Wiping them made third-party SIP clients get Unauthorized while WebRTC still worked.
+      if (body.sip) {
+        body.sip = {
+          ...body.sip,
+          external: (body.sip.external || []).map((a) => {
+            const row = { username: a.username || '' }
+            if (String(a.password || '').trim()) row.password = a.password
+            return row
+          }),
+        }
+      }
       const res = await api.saveInstance(body)
       await refresh()
       // A running line is restarted server-side to apply the new config (pjsip accounts,

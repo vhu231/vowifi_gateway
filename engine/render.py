@@ -28,6 +28,20 @@ def escape_pani_for_asterisk(value: str) -> str:
     return re.sub(r"(?<!\\);", r"\\;", value)
 
 
+def _asterisk_conf_value(value) -> str:
+    """Quote an Asterisk .conf value when it contains comment/space characters.
+
+    Without quotes, `password=foo;bar` is truncated at ';' and digest auth fails with
+    401 Unauthorized for third-party SIP clients.
+    """
+    s = "" if value is None else str(value)
+    if not s:
+        return s
+    if any(ch in s for ch in (";", "#", " ", "\t", '"', "'")):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
 def compose_pani_from_sip(sip: dict) -> str:
     """Lightweight PANI builder for hand-authored instance.json (no MCC table).
 
@@ -228,10 +242,19 @@ def build_context(cfg):
         "sip_tls_port": sip.get("tls_port", 5061),
         "sip_udp_port": sip.get("udp_port", 5060),
         "sip_transport": sip.get("transport", "udp"),  # udp|tcp|tls
-        "external_accounts": sip.get("external", []),
+        # Skip blank usernames; quote conf-unsafe passwords so ';'/'#'/#spaces don't
+        # truncate the Asterisk auth secret (symptom: third-party SIP → Unauthorized).
+        "external_accounts": [
+            {
+                "username": str(a.get("username") or "").strip(),
+                "password": _asterisk_conf_value(a.get("password", "")),
+            }
+            for a in (sip.get("external") or [])
+            if isinstance(a, dict) and str(a.get("username") or "").strip()
+        ],
         "webrtc_enable": bool(webrtc.get("enable", True)),
         "webrtc_user": webrtc.get("username", "webrtc"),
-        "webrtc_password": webrtc.get("password", "webrtc-secret"),
+        "webrtc_password": _asterisk_conf_value(webrtc.get("password", "webrtc-secret")),
         "webrtc_port": webrtc.get("port", 8089),
         "domain": cfg.get("domain", ""),
         # Host-reachable address to advertise to LOCAL SIP clients (Contact + SDP). The

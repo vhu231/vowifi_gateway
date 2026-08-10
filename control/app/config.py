@@ -528,6 +528,45 @@ def validate_sip_external_usernames(sip: dict | None) -> None:
         seen[name] = i
 
 
+def merge_external_sip_accounts(new_list, old_list) -> list:
+    """Merge external SIP accounts, preserving passwords when the client omits them.
+
+    A WebUI save that re-sends username rows with blank password fields must not wipe
+    stored secrets — otherwise Asterisk renders `password=` and third-party SIP clients
+    get 401 Unauthorized while the browser WebRTC softphone (separate credential) still
+    works.
+    """
+    old_by_user = {}
+    for acct in old_list or []:
+        if not isinstance(acct, dict):
+            continue
+        name = str(acct.get("username") or "").strip()
+        if name:
+            old_by_user[name] = acct
+
+    out = []
+    for acct in new_list or []:
+        if not isinstance(acct, dict):
+            continue
+        name = str(acct.get("username") or "").strip()
+        if not name:
+            continue
+        # Missing key or blank/whitespace => keep previous password for this username.
+        if "password" in acct and str(acct.get("password") or "").strip():
+            password = str(acct.get("password"))
+        else:
+            prev = old_by_user.get(name) or {}
+            password = str(prev.get("password") or "")
+        if not password:
+            raise ValueError(
+                f"SIP account '{name}' needs a password "
+                f"(third-party SIP clients will get Unauthorized without one)."
+            )
+        merged_acct = {**acct, "username": name, "password": password}
+        out.append(merged_acct)
+    return out
+
+
 def upsert_instance(inst: dict) -> dict:
     data = load()
     iid = str(inst["id"])
@@ -558,6 +597,18 @@ def upsert_instance(inst: dict) -> dict:
         inst.pop("pin", None)
         if existing.get("pin"):
             inst["pin"] = existing["pin"]
+    # Deep-merge sip so a partial WebUI payload cannot drop unrelated knobs / passwords.
+    if "sip" in inst:
+        old_sip = existing.get("sip") or {}
+        new_sip = inst.get("sip") or {}
+        merged_sip = {**old_sip, **new_sip}
+        if "webrtc" in new_sip or "webrtc" in old_sip:
+            merged_sip["webrtc"] = {**(old_sip.get("webrtc") or {}),
+                                    **(new_sip.get("webrtc") or {})}
+        if "external" in new_sip:
+            merged_sip["external"] = merge_external_sip_accounts(
+                new_sip.get("external"), old_sip.get("external"))
+        inst["sip"] = merged_sip
     merged = {**existing, **inst}
     # Ensure a STABLE WebRTC softphone credential (used by both the Asterisk config and
     # the softphone provisioning endpoint — they must match).

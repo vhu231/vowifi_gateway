@@ -1257,19 +1257,21 @@ async def api_instance_upsert(body: dict):
     if "id" not in body:
         raise HTTPException(400, "id required")
     iid = str(body["id"])
-    # Fail fast on SIP username clashes before touching docker / restart scheduling.
+    # Fail fast on SIP username/password issues before touching docker / restart scheduling.
     if "sip" in body:
         try:
             cfg.validate_sip_external_usernames(body.get("sip"))
         except ValueError as e:
-            raise HTTPException(400, detail={"code": "duplicate_sip_username",
+            raise HTTPException(400, detail={"code": "invalid_sip_account",
                                              "message": str(e)}) from e
     was_running = await asyncio.to_thread(engine.is_running, iid)
     try:
         inst = cfg.upsert_instance(body)
     except ValueError as e:
-        raise HTTPException(400, detail={"code": "duplicate_sip_username",
-                                         "message": str(e)}) from e
+        msg = str(e)
+        code = "duplicate_sip_username" if "more than once" in msg or "reserved" in msg \
+            else "invalid_sip_account"
+        raise HTTPException(400, detail={"code": code, "message": msg}) from e
     applied = False
     # A running line holds its config in the engine container (rendered instance.json:
     # pjsip accounts, IMEI, SMSC, User-Agent, …). Editing the config alone doesn't reach
