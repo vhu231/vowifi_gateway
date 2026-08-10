@@ -1235,6 +1235,18 @@ async def api_instances():
     return {"instances": out}
 
 
+async def _apply_instance_restart(iid: str, inst: dict):
+    """Background docker recreate after a config save. Kept off the HTTP path because
+    force-remove + re-create (many port bindings) routinely exceeds the WebUI's fetch
+    timeout and made 'Save' look like a hang/timeout even though the YAML write succeeded."""
+    try:
+        dev = os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1"
+        await asyncio.to_thread(engine.start, inst, cfg.get_settings(), dev)
+        asyncio.create_task(push_status(iid))
+    except Exception as e:  # noqa
+        log.warning("apply-on-save restart failed for %s: %r", iid, e)
+
+
 @app.post("/api/instances")
 async def api_instance_upsert(body: dict):
     if "id" not in body:
@@ -1246,19 +1258,19 @@ async def api_instance_upsert(body: dict):
     # A running line holds its config in the engine container (rendered instance.json:
     # pjsip accounts, IMEI, SMSC, User-Agent, …). Editing the config alone doesn't reach
     # the running Asterisk — so restart the container to re-render + reload the new config.
+    # Do the docker recreate in the background so the save response stays fast; the UI
+    # already treats applied=true as "saved, restarting to apply".
     if was_running:
         try:
             hub._msisdn_tries.pop(iid, None)
             hub.reset_health(iid)
             await hub.drop_ami(iid)
-            await asyncio.to_thread(engine.start, inst, cfg.get_settings(),
-                                    dev_mounts=os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1")
+            asyncio.create_task(_apply_instance_restart(iid, dict(inst)))
             applied = True
-            asyncio.create_task(push_status(iid))
         except Exception as e:  # noqa
             log.warning("apply-on-save restart failed for %s: %r", iid, e)
     safe = {k: v for k, v in inst.items() if k != "pin"}
-    safe["applied"] = applied      # true => config was re-applied to the running engine
+    safe["applied"] = applied      # true => restart scheduled (or finished) to apply config
     return safe
 
 

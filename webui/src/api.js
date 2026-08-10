@@ -1,6 +1,8 @@
 // Thin REST + WebSocket client for the manager API (same origin).
 const base = ''
 const DEFAULT_TIMEOUT_MS = 15000
+/** Docker recreate / stop can exceed the default fetch budget on slow boards. */
+const ENGINE_TIMEOUT_MS = 120000
 const GET_RETRIES = 2
 const WS_CLOSE_AUTH = 4401
 
@@ -137,11 +139,11 @@ export const api = {
   cards: () => j('GET', '/api/cards'),
   portsSuggest: () => j('GET', '/api/ports/suggest'),
   provision: (body) => j('POST', '/api/provision', body),
-  saveInstance: (inst) => j('POST', '/api/instances', inst),
-  deleteInstance: (id) => j('DELETE', `/api/instances/${id}`),
-  start: (id, body) => j('POST', `/api/instances/${id}/start`, body || {}),
-  stop: (id) => j('POST', `/api/instances/${id}/stop`),
-  reprovision: (id, body) => j('POST', `/api/instances/${id}/reprovision`, body || {}),
+  saveInstance: (inst) => j('POST', '/api/instances', inst, { timeoutMs: ENGINE_TIMEOUT_MS }),
+  deleteInstance: (id) => j('DELETE', `/api/instances/${id}`, undefined, { timeoutMs: ENGINE_TIMEOUT_MS }),
+  start: (id, body) => j('POST', `/api/instances/${id}/start`, body || {}, { timeoutMs: ENGINE_TIMEOUT_MS }),
+  stop: (id) => j('POST', `/api/instances/${id}/stop`, undefined, { timeoutMs: ENGINE_TIMEOUT_MS }),
+  reprovision: (id, body) => j('POST', `/api/instances/${id}/reprovision`, body || {}, { timeoutMs: ENGINE_TIMEOUT_MS }),
   clearPin: (id) => j('POST', `/api/instances/${id}/pin/clear`),
   status: (id) => j('GET', `/api/instances/${id}/status`),
   logs: (id, tail = 300) => j('GET', `/api/instances/${id}/logs?tail=${tail}`),
