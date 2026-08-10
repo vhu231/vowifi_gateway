@@ -95,7 +95,7 @@ Set via **env vars** (or a `.env` file next to `install.sh`) before running `ins
 | `VOWIFI_MODE` | `local` | Deploy mode: `local` (native control plane, Docker engine only) or `docker` (both containerized). Overridable per-command with `--mode`. |
 | `VOWIFI_PORT` | `8443` | Host port the WebUI is served/published on |
 | `VOWIFI_DATA_DIR` | `<repo>/data` | Runtime data directory (config, logs, DB, certs) |
-| `VOWIFI_ADVERTISE_ADDR` | auto-detect | Host LAN IP advertised to SIP/WebRTC clients for RTP (auto-detect uses `ip route get` or `hostname -I`; override if your host is multi-homed or the auto-detect picks the wrong NIC) |
+| `VOWIFI_ADVERTISE_ADDR` | auto-detect | Host LAN IP advertised to SIP/WebRTC clients for RTP/Contact/SDP. Overrides Settings → *SIP / WebRTC advertise address*. Auto-detect prefers a real LAN NIC and skips VPN/docker; pin explicitly on multi-homed hosts. |
 | `VOWIFI_BIND` | `0.0.0.0` | Bind address for the control plane (rarely changed) |
 | `VOWIFI_WEB_PASSWORD` | _(empty)_ | Optional WebUI/API password. When set, overrides any password stored in Settings and forces login. Clear + restart to return control to the WebUI Settings page. |
 | `PCSC_VERSION` | `2.3.3` | pcsc-lite version pinned across host + all images |

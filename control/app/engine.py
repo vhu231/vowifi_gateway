@@ -97,6 +97,9 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
     # to /api/engine/event with X-Vowifi-Engine-Token; an older engine image without that
     # header silently 401s after Web-auth upgrades. Binding the repo copy avoids requiring
     # an immediate `docker build` of vowifi/engine just to restore receive path.
+    # Host trees from Windows/git often lack +x — chmod before bind or Asterisk TrySystem
+    # gets Permission denied (swu_ike uses python3 and still works → send OK / receive broken).
+    ensure_notify_executable()
     notify_src = notify_script_path()
     if notify_src:
         volumes[notify_src] = {"bind": "/usr/local/bin/notify.py", "mode": "ro"}
@@ -212,6 +215,65 @@ def notify_script_path() -> str | None:
     return path if os.path.isfile(path) else None
 
 
+def ensure_notify_executable() -> bool:
+    """Host bind-mount of notify.py must be +x — Asterisk TrySystem execs the path.
+
+    Windows checkouts often land as 0666; without chmod, dialplan gets Permission denied
+    while swu_ike (python3 notify.py) still works — send OK, receive missing from UI.
+    """
+    path = notify_script_path()
+    if not path:
+        return False
+    try:
+        mode = os.stat(path).st_mode
+        if mode & 0o111:
+            return False
+        os.chmod(path, (mode | 0o755) & 0o777)
+        return True
+    except OSError as e:
+        log.warning("chmod +x notify.py failed: %r", e)
+        return False
+
+
+def patch_running_dialplan_notify_python() -> int:
+    """Hot-fix Asterisk dialplan: invoke notify via /usr/bin/python3 (no +x needed)."""
+    client = _client()
+    updated = 0
+    for inst in cfg.list_instances():
+        iid = str(inst["id"])
+        try:
+            c = client.containers.get(container_name(iid))
+            if c.status != "running":
+                continue
+            # sed in-place; reload dialplan so SMS path picks it up without IMS tear-down.
+            script = (
+                "python3 - <<'PY'\n"
+                "import pathlib\n"
+                "p=pathlib.Path('/etc/asterisk/extensions.conf')\n"
+                "t=p.read_text()\n"
+                "n=t.replace('TrySystem(/usr/local/bin/notify.py',"
+                "'TrySystem(/usr/bin/python3 /usr/local/bin/notify.py')\n"
+                "if n!=t:\n"
+                "    p.write_text(n); print('patched')\n"
+                "else:\n"
+                "    print('ok')\n"
+                "PY\n"
+                "asterisk -rx 'dialplan reload' >/dev/null 2>&1 || true\n"
+            )
+            rc, out = c.exec_run(["sh", "-c", script])
+            text = (out or b"").decode("utf-8", errors="replace")
+            if rc == 0:
+                updated += 1
+                log.info("dialplan notify python3 patch engine %s: %s", iid, text.strip()[:80])
+            else:
+                log.warning("dialplan patch failed engine %s rc=%s: %s", iid, rc, text[:200])
+        except docker.errors.NotFound:
+            continue
+        except Exception as e:  # noqa
+            log.warning("dialplan patch engine %s failed: %r", iid, e)
+    return updated
+
+
 def push_notify_script_to_running() -> int:
     """Hot-patch /usr/local/bin/notify.py inside every running engine container.
 
@@ -252,7 +314,10 @@ def push_notify_script_to_running() -> int:
         except docker.errors.NotFound:
             continue
         except Exception as e:  # noqa
-            log.warning("hot-patch notify.py on engine %s failed: %r", iid, e)
+            # Bind-mounted host notify.py commonly rejects put_archive (Docker 500).
+            # ensure_notify_executable() + dialplan `python3 notify.py` cover that case.
+            log.info("hot-patch notify.py on engine %s skipped/failed (bind-mount ok): %r",
+                     iid, e)
     return updated
 
 
@@ -261,18 +326,34 @@ def heal_callback_auth() -> dict:
 
     1) Write ENGINE_TOKEN into each host-mounted engine.env (notify re-reads per call).
     2) Push the current notify.py into running containers (adds the token header).
+    3) chmod +x host notify.py and hot-patch dialplan to `python3 notify.py`.
     """
     token_files = 0
     try:
         token_files = cfg.sync_engine_token_to_run_dirs()
     except Exception as e:  # noqa
         log.warning("sync_engine_token_to_run_dirs failed: %r", e)
+    notify_chmod = False
+    try:
+        notify_chmod = ensure_notify_executable()
+    except Exception as e:  # noqa
+        log.warning("ensure_notify_executable failed: %r", e)
     notify_pushed = 0
     try:
         notify_pushed = push_notify_script_to_running()
     except Exception as e:  # noqa
         log.warning("push_notify_script_to_running failed: %r", e)
-    return {"token_files_updated": token_files, "notify_pushed": notify_pushed}
+    dialplan_patched = 0
+    try:
+        dialplan_patched = patch_running_dialplan_notify_python()
+    except Exception as e:  # noqa
+        log.warning("patch_running_dialplan_notify_python failed: %r", e)
+    return {
+        "token_files_updated": token_files,
+        "notify_pushed": notify_pushed,
+        "notify_chmod": notify_chmod,
+        "dialplan_patched": dialplan_patched,
+    }
 
 
 def callback_health() -> dict:

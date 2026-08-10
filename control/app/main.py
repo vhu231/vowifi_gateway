@@ -25,6 +25,7 @@ from . import config as cfg
 from . import store, engine, status as status_mod, sim, card, notify_push, lpa, estkme, usbreader
 from . import auth as auth_mod
 from . import event_log
+from . import messages_txt
 from .ami import AmiClient
 
 logging.basicConfig(level=logging.INFO,
@@ -612,6 +613,14 @@ async def lifespan(app: FastAPI):
             log.info("event_log backfill processed %d engine event(s)", n)
     except Exception as e:  # noqa
         log.warning("event_log backfill failed: %r", e)
+    # Second safety net: dialplan FILE() always writes messages.txt even when notify.py
+    # cannot exec (non-executable bind-mount). Recover those inbound rows into SQLite.
+    try:
+        n = await _ingest_messages_txt()
+        if n:
+            log.info("messages.txt backfill inserted %d inbound SMS", n)
+    except Exception as e:  # noqa
+        log.warning("messages.txt backfill failed: %r", e)
     poller = asyncio.create_task(status_poller())
     monitor = asyncio.create_task(card_monitor())
     elog = asyncio.create_task(event_log_poller())
@@ -1251,7 +1260,10 @@ def api_get_settings():
 
 @app.put("/api/settings")
 def api_put_settings(body: dict):
-    return cfg.update_settings(body)
+    try:
+        return cfg.update_settings(body)
+    except ValueError as e:
+        raise HTTPException(400, detail={"code": "invalid_settings", "message": str(e)}) from e
 
 
 # ----------------------------- instances -----------------------------
@@ -1895,6 +1907,32 @@ async def _ingest_event_logs(*, backfill: bool) -> int:
     for ev in pending:
         await apply_engine_event(ev, source="event_log")
     return n
+
+
+async def _ingest_messages_txt() -> int:
+    """Insert inbound SMS from dialplan messages.txt that never reached notify/SQLite."""
+    pending: list[dict] = []
+
+    def collect(row: dict):
+        pending.append(row)
+
+    await asyncio.to_thread(lambda: messages_txt.backfill_once(collect))
+    inserted = 0
+    for row in pending:
+        iid = str(row.get("instance") or "")
+        peer = row.get("peer") or ""
+        body = row.get("body") or ""
+        if not iid or not body.strip():
+            continue
+        if store.has_message(iid, "in", peer, body):
+            continue
+        # Prefer trailing newline form used by notify decode when either works for dedupe.
+        rec = store.add_message(iid, "in", peer, body, ts=row.get("ts"))
+        await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
+        _dispatch_push(notify_push.EV_INCOMING_SMS, iid, peer, body)
+        log.info("inbound SMS via messages.txt instance=%s from=%r", iid, peer)
+        inserted += 1
+    return inserted
 
 
 async def event_log_poller():

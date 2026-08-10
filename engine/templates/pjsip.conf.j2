@@ -65,9 +65,9 @@ dedicated_bearer_up=yes
 100rel=peer_supported
 moh_passthrough=yes
 direct_media=no
-; In-call digits (IVR): prefer RFC4733 telephone-event, else SIP INFO. Plain inband
-; DTMF is destroyed by AMR transcoding, so do not fall back to inband (dtmf_mode=auto).
-dtmf_mode=auto_info
+; IMS DTMF stays at Asterisk default rfc4733 (same as upstream). Carriers expect
+; telephone-event on the VoWiFi leg; do not set auto_info here — SIP INFO toward
+; P-CSCF is often ignored and would break IVR for every client, including WebRTC.
 smsc_uri=sip:{{ smsc }}@{{ realm }}
 sdp_owner={{ sdp_owner }}
 sdp_session={{ sdp_session }}
@@ -159,10 +159,15 @@ message_context=msg-from-local
 ; shows no incoming-call (Answer/Decline) overlay. The IMS realm is always a valid FQDN.
 from_domain={{ realm }}
 disallow=all
-allow=amr
+; Prefer narrowband PCM first so Linphone/MicroSIP negotiate PCMU + telephone-event/8000.
+; With opus first (or only opus accepted), clients often send telephone-event/48000; on
+; Asterisk 20.7 that path commonly yields silent keypad digits (no DTMF frames in the
+; bridge) while WebRTC insertDTMF may still appear to work on some builds. AMR stays
+; available but last — the IMS leg already uses AMR via transcoding.
 allow=ulaw
 allow=alaw
 allow=opus
+allow=amr
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
@@ -172,9 +177,10 @@ rewrite_contact=yes
 ; left on (the default) Asterisk would try to re-INVITE the two ends to talk directly, which
 ; can't work → no audio. (volte_ims already has direct_media=no.)
 direct_media=no
-; In-call keypad digits. Browser softphone uses WebRTC insertDTMF (RFC4733). Many third-party
-; SIP clients send SIP INFO or RFC2833; default dtmf_mode=rfc4733 alone drops INFO, and
-; inband tones do not survive AMR on the IMS leg — symptom: softphone IVR works, SIP IVR fails.
+; Local SIP/WebRTC keypad → Asterisk → IMS. Upstream leaves this at default rfc4733.
+; Browser softphone uses WebRTC insertDTMF (RFC4733). Linphone with "RFC2833 + SIP INFO"
+; prefers RFC2833 whenever telephone-event is offered — if that RTP path fails, INFO is
+; never sent. auto_info still accepts INFO when 2833 is not negotiated.
 dtmf_mode=auto_info
 {% if msisdn %}
 callerid=undefined <{{ msisdn }}>

@@ -46,7 +46,7 @@ export default function Settings({ auth, onAuthChange }) {
     try {
       const next = await api.saveSettings(s)
       setS(next)
-      setMsg('Saved. Restart the control surface for TLS/port changes, and re-provision a line for ring-timeout changes, to take effect.')
+      setMsg('Saved. Restart the control surface for TLS/port changes. Re-provision (or Stop→Start) lines for advertise-address, ring-timeout, and other engine settings to take effect.')
     } catch (e) {
       setMsg('Error: ' + e.message)
     }
@@ -175,6 +175,50 @@ export default function Settings({ auth, onAuthChange }) {
           <div />
           <div><label htmlFor="tls_cert">Cert path</label><input id="tls_cert" className="mono" value={s.tls.cert_path || ''} onChange={(e) => updTls({ cert_path: e.target.value })} placeholder="/path/fullchain.pem" /></div>
           <div><label htmlFor="tls_key">Key path</label><input id="tls_key" className="mono" value={s.tls.key_path || ''} onChange={(e) => updTls({ key_path: e.target.value })} placeholder="/path/privkey.pem" /></div>
+        </div>
+      </div>
+
+      <div className="card" style={{ padding: 20 }}>
+        <h3 style={{ marginTop: 0 }}>SIP / WebRTC advertise address</h3>
+        <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 10 }}>
+          Address written into local SIP Contact and SDP (<code>external_media_address</code>) so
+          Linphone / MicroSIP / the browser softphone send RTP and DTMF back to this host.
+          Leave blank to auto-detect a LAN NIC (VPN/docker interfaces are skipped).
+          On multi-homed hosts (LAN + VPN) set this explicitly to your LAN IP
+          (e.g. <code>192.168.6.239</code>). Same as env <code>VOWIFI_ADVERTISE_ADDR</code>.
+        </div>
+        {!!s.advertise_address_managed_by_env ? (
+          <div style={{
+            padding: '10px 12px', borderRadius: 8, marginBottom: 10,
+            background: 'var(--bg-elev, rgba(0,0,0,.2))', fontSize: 13,
+          }}>
+            Managed by env <code>VOWIFI_ADVERTISE_ADDR</code> —
+            effective <span className="mono">{s.advertise_address_effective || '—'}</span>.
+            Clear the env var to edit the stored value here.
+          </div>
+        ) : (
+          <div>
+            <label htmlFor="advertise_address">Advertise address (IP or hostname)</label>
+            <input
+              id="advertise_address"
+              className="mono"
+              value={s.advertise_address || ''}
+              onChange={(e) => upd({ advertise_address: e.target.value })}
+              placeholder={s.advertise_address_detected
+                ? `auto → ${s.advertise_address_detected}`
+                : 'auto (detect LAN IP)'}
+              disabled={!!s.advertise_address_managed_by_env}
+            />
+          </div>
+        )}
+        <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-mute)' }} className="mono">
+          Effective now: {s.advertise_address_effective || '—'}
+          {s.advertise_address_detected
+            ? ` · detected LAN: ${s.advertise_address_detected}`
+            : ''}
+        </div>
+        <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-mute)' }}>
+          After saving, Stop→Start (or Re-provision) each running line so Asterisk reloads SDP.
         </div>
       </div>
 

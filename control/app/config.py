@@ -11,6 +11,7 @@ import json
 import os
 import secrets
 import socket
+import subprocess
 import threading
 from copy import deepcopy
 
@@ -29,6 +30,9 @@ DEFAULTS = {
         "tls": {"self_signed": True, "domain": "", "cert_path": "", "key_path": ""},
         "debug": {"asterisk": True, "charon": False, "pcap": False},
         "manager_url": "",          # reachable URL engines POST events to (auto if empty)
+        # Host IP/hostname advertised to LOCAL SIP/WebRTC clients (Contact + SDP).
+        # Empty = auto-detect LAN NIC (skips VPN/docker). VOWIFI_ADVERTISE_ADDR env overrides.
+        "advertise_address": "",
         # auto_recover: after a network-class freeze (ePDG/DNS/tunnel timeout), probe
         # connectivity and auto re-provision when the network returns. Off = sticky ERROR
         # until the user presses Start / Re-provision.
@@ -90,21 +94,76 @@ PORT_STRIDE = {"sip_udp": 10, "sip_tls": 10, "webrtc": 10, "ami": 10,
                "rtp_start": 2000, "rtp_end": 2000}
 
 
+def _iface_is_lan_candidate(name: str) -> bool:
+    """True if this interface is likely a host LAN NIC (not docker/VPN/tunnel)."""
+    n = (name or "").lower()
+    if not n or n == "lo":
+        return False
+    skip_prefixes = (
+        "docker", "br-", "veth", "virbr", "cni", "flannel", "tun", "tap",
+        "wg", "ipsec", "vti", "gre", "gretap", "erspan", "sit", "nlmon",
+        "uk-", "nordlynx", "ppp",
+    )
+    return not any(n.startswith(p) or n == p.rstrip("-") for p in skip_prefixes)
+
+
 def _host_lan_ipv4() -> str:
     """Best-effort primary LAN IPv4 of the host the manager runs on. Used as the address
     Asterisk advertises to LOCAL SIP clients (Contact + SDP), so a LAN MicroSIP can route
     in-dialog requests (BYE) back to the published host port instead of the unroutable
-    docker-bridge container IP. Uses a UDP connect (no traffic sent) to learn the source
-    address the kernel would pick for outbound; returns "" if it can't be determined."""
+    docker-bridge container IP.
+
+    Prefer a real LAN NIC (eth*/en*/wlan*) over whatever the kernel picks for
+    default-route UDP connect — a WireGuard/VPN default route otherwise yields the
+    tunnel address (e.g. 10.14.0.2) in SDP, and Linphone RFC2833/RTP goes nowhere.
+    """
+    # 1) Enumerate non-tunnel IPv4s (Linux: /sys/class/net + ioctl via hostname -I fallback).
+    try:
+        import struct
+        import fcntl
+        for name in sorted(os.listdir("/sys/class/net")):
+            if not _iface_is_lan_candidate(name):
+                continue
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    ifreq = struct.pack("256s", name[:15].encode())
+                    ip = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, ifreq)[20:24])  # SIOCGIFADDR
+                finally:
+                    s.close()
+                if ip and not ip.startswith("127.") and not ip.startswith("172.17."):
+                    return ip
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # 2) Fallback: UDP connect — but reject typical VPN/CGNAT tunnel sources when we can
+    #    still find a 192.168/16 address via hostname -I.
+    route_ip = ""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("1.1.1.1", 80))
-        ip = s.getsockname()[0]
-        return ip if ip and not ip.startswith("127.") else ""
+        route_ip = s.getsockname()[0] or ""
     except Exception:
-        return ""
+        route_ip = ""
     finally:
         s.close()
+    extras: list[str] = []
+    try:
+        out = subprocess.check_output(["hostname", "-I"], text=True, stderr=subprocess.DEVNULL)
+        extras = [p for p in out.split() if ":" not in p and not p.startswith("127.")]
+    except Exception:
+        pass
+    lanish = [ip for ip in extras
+              if ip.startswith("192.168.") or ip.startswith("10.0.") or ip.startswith("10.1.")]
+    if route_ip and not route_ip.startswith("127."):
+        # Trust route_ip only if it looks like LAN or we have no better candidate.
+        if route_ip.startswith("192.168.") or route_ip.startswith("172.16.") or route_ip.startswith("172.18."):
+            return route_ip
+        if lanish:
+            return lanish[0]
+        return route_ip
+    return (lanish[0] if lanish else (extras[0] if extras else ""))
 
 
 def ims_realm(mcc: str, mnc: str) -> str:
@@ -115,18 +174,41 @@ def ims_realm(mcc: str, mnc: str) -> str:
     return f"ims.mnc{str(mnc).zfill(3)}.mcc{str(mcc)}.3gppnetwork.org"
 
 
-def advertise_address(settings: dict) -> str:
-    """The host-reachable address to advertise to local SIP clients. Precedence: explicit
-    TLS domain (already used as the TLS external address) > VOWIFI_ADVERTISE_ADDR env >
-    settings.advertise_address > auto-detected host LAN IPv4.
+def normalize_advertise_address(value) -> str:
+    """Strip and lightly validate a user/env advertise host. Empty = auto."""
+    s = ("" if value is None else str(value)).strip()
+    if not s:
+        return ""
+    # Single token only (IP or hostname); reject whitespace / URLs with scheme.
+    if any(ch.isspace() for ch in s) or "://" in s:
+        raise ValueError("advertise_address must be a bare IPv4/IPv6 or hostname "
+                         "(e.g. 192.168.6.239), not a URL")
+    return s
 
-    The env override matters when the control plane itself runs in a (bridge-networked)
-    container: _host_lan_ipv4() would then return the container's docker-bridge IP, not the
-    host LAN IP a SIP/WebRTC client must reach. The installer passes the real host IP in
-    VOWIFI_ADVERTISE_ADDR."""
-    tls_domain = (settings.get("tls", {}) or {}).get("domain", "")
-    return (tls_domain or os.environ.get("VOWIFI_ADVERTISE_ADDR", "")
-            or settings.get("advertise_address", "") or _host_lan_ipv4())
+
+def advertise_address_managed_by_env() -> bool:
+    return bool((os.environ.get("VOWIFI_ADVERTISE_ADDR") or "").strip())
+
+
+def advertise_address(settings: dict) -> str:
+    """The host-reachable address to advertise to local SIP clients. Precedence:
+    VOWIFI_ADVERTISE_ADDR env > settings.advertise_address > TLS domain >
+    auto-detected host LAN IPv4.
+
+    Env wins so installers / multi-homed hosts can pin the LAN IP even when a TLS
+    domain is also configured. settings.advertise_address is what the WebUI edits.
+    TLS domain remains a useful fallback when the gateway is reached by hostname.
+    """
+    env = normalize_advertise_address(os.environ.get("VOWIFI_ADVERTISE_ADDR", ""))
+    if env:
+        return env
+    stored = normalize_advertise_address(settings.get("advertise_address", ""))
+    if stored:
+        return stored
+    tls_domain = ((settings.get("tls", {}) or {}).get("domain") or "").strip()
+    if tls_domain:
+        return tls_domain
+    return _host_lan_ipv4() or ""
 
 
 def _ensure():
@@ -196,6 +278,15 @@ def public_settings() -> dict:
         "enabled": bool(env_pw) or bool((auth.get("password_hash") or "").strip()),
         "managed_by_env": bool(env_pw),
     }
+    # Advertise address: expose stored value + what engines will actually use.
+    try:
+        stored = normalize_advertise_address(s.get("advertise_address", ""))
+    except ValueError:
+        stored = (s.get("advertise_address") or "").strip()
+    s["advertise_address"] = stored
+    s["advertise_address_effective"] = advertise_address(s)
+    s["advertise_address_managed_by_env"] = advertise_address_managed_by_env()
+    s["advertise_address_detected"] = _host_lan_ipv4() or ""
     return s
 
 
@@ -205,11 +296,37 @@ def update_settings(patch: dict) -> dict:
     data = load()
     patch = dict(patch or {})
     patch.pop("auth", None)
+    # Drop computed advertise_* fields the WebUI may echo back on save.
+    for k in ("advertise_address_effective", "advertise_address_managed_by_env",
+              "advertise_address_detected"):
+        patch.pop(k, None)
+    if "advertise_address" in patch:
+        try:
+            patch["advertise_address"] = normalize_advertise_address(patch.get("advertise_address"))
+        except ValueError as e:
+            raise ValueError(str(e)) from e
     preserved_auth = data["settings"].get("auth")
+    try:
+        prev_adv = normalize_advertise_address(data["settings"].get("advertise_address", ""))
+    except ValueError:
+        prev_adv = ""
     data["settings"].update(patch)
     if preserved_auth is not None:
         data["settings"]["auth"] = preserved_auth
     save(data)
+    # If advertise address changed, refresh each instance.json so the next engine
+    # start/re-provision (or a manual render) picks up the new Contact/SDP address.
+    try:
+        new_adv = normalize_advertise_address(data["settings"].get("advertise_address", ""))
+    except ValueError:
+        new_adv = ""
+    if new_adv != prev_adv or "advertise_address" in patch:
+        settings = data["settings"]
+        for inst in list((data.get("instances") or {}).values()):
+            try:
+                write_instance_json(inst, settings)
+            except Exception:
+                pass
     return public_settings()
 
 

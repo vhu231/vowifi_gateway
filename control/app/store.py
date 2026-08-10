@@ -61,8 +61,9 @@ def set_message_status(mid: int, status: str, error: str | None = None):
         c.execute("UPDATE messages SET status=?, error=? WHERE id=?", (status, error, mid))
 
 
-def add_message(instance: str, direction: str, peer: str, body: str, status: str = "ok") -> dict:
-    ts = int(time.time())
+def add_message(instance: str, direction: str, peer: str, body: str, status: str = "ok",
+                ts: int | None = None) -> dict:
+    ts = int(ts if ts is not None else time.time())
     with _lock, _conn() as c:
         cur = c.execute(
             "INSERT INTO messages(instance,direction,peer,body,status,ts) VALUES(?,?,?,?,?,?)",
@@ -74,13 +75,25 @@ def add_message(instance: str, direction: str, peer: str, body: str, status: str
 
 
 def has_message(instance: str, direction: str, peer: str, body: str) -> bool:
-    """True if an identical message row already exists (event_log / HTTP dedupe)."""
+    """True if an identical message row already exists (event_log / HTTP dedupe).
+
+    Body compare is exact OR trailing-newline-normalized — notify/base64 decode and
+    messages.txt FILE() often differ by a final \\n.
+    """
+    bodies = {body}
+    if body.endswith("\n"):
+        bodies.add(body.rstrip("\n"))
+    else:
+        bodies.add(body + "\n")
     with _lock, _conn() as c:
-        row = c.execute(
-            "SELECT id FROM messages WHERE instance=? AND direction=? AND peer=? AND body=? LIMIT 1",
-            (str(instance), direction, peer, body),
-        ).fetchone()
-        return row is not None
+        for b in bodies:
+            row = c.execute(
+                "SELECT id FROM messages WHERE instance=? AND direction=? AND peer=? AND body=? LIMIT 1",
+                (str(instance), direction, peer, b),
+            ).fetchone()
+            if row is not None:
+                return True
+        return False
 
 
 def list_threads(instance: str) -> list:
