@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
 from . import store, engine, status as status_mod, sim, card, notify_push, lpa, estkme, usbreader
+from . import auth as auth_mod
 from .ami import AmiClient
 
 logging.basicConfig(level=logging.INFO,
@@ -87,6 +88,20 @@ class Hub:
         if c:
             await c.close()
 
+    async def drop_ws_client(self, ws: WebSocket):
+        self.clients.discard(ws)
+
+    async def close_all_websockets(self, code: int = auth_mod.WS_CLOSE_AUTH,
+                                   reason: str = "session invalidated"):
+        """Force-close every live WebUI socket (e.g. after password change)."""
+        dead = list(self.clients)
+        for ws in dead:
+            try:
+                await ws.close(code=code, reason=reason)
+            except Exception:
+                pass
+            await self.drop_ws_client(ws)
+
     async def broadcast(self, msg: dict):
         dead = []
         for ws in list(self.clients):
@@ -95,7 +110,7 @@ class Hub:
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            self.clients.discard(ws)
+            await self.drop_ws_client(ws)
 
     async def ami_for(self, iid: str) -> AmiClient | None:
         iid = str(iid)
@@ -574,6 +589,9 @@ async def _auto_recover(iid: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store.init()
+    # Persist session/engine secrets (and rotate credential_version if the env
+    # password fingerprint changed) before serving any requests.
+    cfg.ensure_auth_secrets()
     poller = asyncio.create_task(status_poller())
     monitor = asyncio.create_task(card_monitor())
     yield
@@ -584,9 +602,152 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(poller, monitor, return_exceptions=True)
     for c in hub.ami.values():
         await c.close()
+    await hub.close_all_websockets(code=1001, reason="shutdown")
 
 
 app = FastAPI(title="VoWiFi Gateway", lifespan=lifespan)
+
+
+def _session_authenticated(request: Request) -> bool:
+    """True when auth is disabled, or a valid session cookie is present."""
+    if not cfg.auth_enabled():
+        return True
+    token = request.cookies.get(auth_mod.COOKIE_NAME) or ""
+    if not token:
+        return False
+    auth = cfg.get_auth()
+    return auth_mod.verify_session(
+        auth["session_secret"], token, int(auth.get("credential_version") or 1))
+
+
+def _auth_status_payload(request: Request) -> dict:
+    enabled = cfg.auth_enabled()
+    return {
+        "enabled": enabled,
+        "authenticated": (not enabled) or _session_authenticated(request),
+        "managed_by_env": cfg.auth_managed_by_env(),
+    }
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    # Engine callbacks use their own token (checked in the handler), not the Web cookie.
+    if path == "/api/engine/event":
+        return await call_next(request)
+    if path in auth_mod.PUBLIC_EXACT or path.startswith("/assets/"):
+        return await call_next(request)
+    # SPA shell + non-API static: public (JS will gate itself via /api/auth/status).
+    if not auth_mod.is_api_or_docs(path):
+        return await call_next(request)
+    if not cfg.auth_enabled():
+        return await call_next(request)
+    if not _session_authenticated(request):
+        return auth_mod.auth_required_response()
+    # CSRF: cookie-authenticated mutating requests must be same-origin.
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        if request.cookies.get(auth_mod.COOKIE_NAME) and not auth_mod.origin_ok(request):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": {"code": "csrf_rejected", "message": "Origin check failed"}},
+            )
+    return await call_next(request)
+
+
+# ----------------------------- auth -----------------------------
+@app.get("/api/auth/status")
+def api_auth_status(request: Request):
+    return _auth_status_payload(request)
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(request: Request, body: dict):
+    if not cfg.auth_enabled():
+        # No password configured — treat as already open.
+        return {"ok": True, **_auth_status_payload(request)}
+    ip = auth_mod.client_ip(request)
+    if auth_mod.login_rate_limited(ip):
+        raise HTTPException(429, detail={"code": "rate_limited",
+                                         "message": "Too many failed login attempts; try again shortly"})
+    password = body.get("password") if isinstance(body, dict) else None
+    if not isinstance(password, str) or not cfg.effective_password_check(password):
+        auth_mod.record_login_failure(ip)
+        raise HTTPException(401, detail={"code": "invalid_password",
+                                         "message": "Invalid password"})
+    auth_mod.clear_login_failures(ip)
+    auth = cfg.get_auth()
+    # Env-managed passwords still need a stable session secret + version.
+    token = auth_mod.sign_session(auth["session_secret"],
+                                  int(auth.get("credential_version") or 1))
+    secure = auth_mod.request_wants_secure_cookie(request)
+    resp = JSONResponse({"ok": True, "enabled": True, "authenticated": True,
+                         "managed_by_env": cfg.auth_managed_by_env()})
+    auth_mod.set_session_cookie(resp, token, secure=secure)
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def api_auth_logout(request: Request):
+    secure = auth_mod.request_wants_secure_cookie(request)
+    resp = JSONResponse({"ok": True, "enabled": cfg.auth_enabled(),
+                         "authenticated": not cfg.auth_enabled(),
+                         "managed_by_env": cfg.auth_managed_by_env()})
+    auth_mod.clear_session_cookie(resp, secure=secure)
+    return resp
+
+
+@app.put("/api/auth/password")
+async def api_auth_password(request: Request, body: dict):
+    """Set, change, or clear the Web password.
+
+    Body:
+      password: new password (non-empty) to set/change
+      clear: true to remove the password (open access)
+      current_password: required when a password is already enabled (and not env-managed)
+    """
+    if cfg.auth_managed_by_env():
+        raise HTTPException(400, detail={"code": "managed_by_env",
+                                         "message": "Password is managed by VOWIFI_WEB_PASSWORD"})
+    body = body or {}
+    clear = bool(body.get("clear"))
+    new_pw = body.get("password") if isinstance(body.get("password"), str) else ""
+    current = body.get("current_password") if isinstance(body.get("current_password"), str) else ""
+
+    if cfg.auth_enabled():
+        # Must prove knowledge of the current password before changing/clearing
+        # (unless this request is already cookie-authenticated — still require current
+        # when changing, to stop a stolen session from locking the owner out silently).
+        if not cfg.effective_password_check(current):
+            raise HTTPException(401, detail={"code": "invalid_password",
+                                             "message": "Current password is incorrect"})
+
+    try:
+        if clear:
+            result = cfg.clear_web_password()
+        else:
+            if not new_pw.strip():
+                raise HTTPException(400, detail={"code": "empty_password",
+                                                 "message": "New password must not be empty"})
+            result = cfg.set_web_password(new_pw)
+    except ValueError as e:
+        raise HTTPException(400, detail={"code": "password_error", "message": str(e)})
+
+    # Invalidate every live session (other devices + this one's old cookie).
+    await hub.close_all_websockets()
+
+    secure = auth_mod.request_wants_secure_cookie(request)
+    if result.get("enabled"):
+        # Issue a fresh cookie for the device that just set the password.
+        auth = cfg.get_auth()
+        token = auth_mod.sign_session(auth["session_secret"],
+                                      int(auth.get("credential_version") or 1))
+        resp = JSONResponse({"ok": True, **result, "authenticated": True})
+        auth_mod.set_session_cookie(resp, token, secure=secure)
+        return resp
+
+    resp = JSONResponse({"ok": True, **result, "authenticated": True})
+    auth_mod.clear_session_cookie(resp, secure=secure)
+    return resp
 
 
 # ----------------------------- SIM / readers -----------------------------
@@ -1040,7 +1201,7 @@ async def api_provision(body: dict):
 # ----------------------------- settings -----------------------------
 @app.get("/api/settings")
 def api_get_settings():
-    return cfg.get_settings()
+    return cfg.public_settings()
 
 
 @app.put("/api/settings")
@@ -1541,9 +1702,23 @@ def _call_disposition(dialstatus: str, cause: int, direction: str = "out") -> st
     return (dialstatus.lower() if dialstatus else "cancelled")
 
 
+def _engine_event_authorized(request: Request, payload: dict) -> bool:
+    """Admit engine callbacks only with a matching X-Vowifi-Engine-Token.
+
+    Reload recreates engine containers, so every live engine has the token from
+    render.py — no legacy IP fallback.
+    """
+    expected = cfg.engine_callback_token()
+    got = (request.headers.get(auth_mod.ENGINE_TOKEN_HEADER) or "").strip()
+    return bool(expected and got and cfg.hmac_compare(got, expected))
+
+
 @app.post("/api/engine/event")
-async def api_engine_event(payload: dict):
+async def api_engine_event(request: Request, payload: dict):
     """Receives notify.py callbacks from engine containers."""
+    if not _engine_event_authorized(request, payload):
+        raise HTTPException(401, detail={"code": "engine_unauthorized",
+                                         "message": "Invalid engine callback credentials"})
     iid = str(payload.get("instance", ""))
     event = payload.get("event", "")
     args = payload.get("args", [])
@@ -1952,15 +2127,26 @@ async def api_esim_notification_remove(
 # ----------------------------- WebSocket -----------------------------
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    # Auth gate: when a password is configured, require a valid session cookie.
+    # Accept first, then close with 4401 — rejecting before accept() is unreliable
+    # across browsers (close code / onclose may not fire cleanly).
+    if cfg.auth_enabled():
+        token = ws.cookies.get(auth_mod.COOKIE_NAME) or ""
+        auth = cfg.get_auth()
+        if not token or not auth_mod.verify_session(
+                auth["session_secret"], token, int(auth.get("credential_version") or 1)):
+            await ws.accept()
+            await ws.close(code=auth_mod.WS_CLOSE_AUTH, reason="authentication required")
+            return
     await ws.accept()
     hub.clients.add(ws)
     try:
         while True:
             await ws.receive_text()  # keepalive / ignore inbound
     except WebSocketDisconnect:
-        hub.clients.discard(ws)
+        await hub.drop_ws_client(ws)
     except Exception:
-        hub.clients.discard(ws)
+        await hub.drop_ws_client(ws)
 
 
 # ----------------------------- static WebUI -----------------------------

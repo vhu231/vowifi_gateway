@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { api } from '../api.js'
+import Dialog from '../components/Dialog.jsx'
 
 const PIN_RE = /^\d{4,8}$/
 const PORT_RE = /^\d{1,5}$/
@@ -85,68 +86,65 @@ export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) 
   )
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: '#000a', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50 }}
-      onClick={onClose}>
-      <div className="card" style={{ padding: 24, width: 460, maxWidth: '92vw', maxHeight: '92vh', overflow: 'auto' }} onClick={(e) => e.stopPropagation()}>
-        <h2 style={{ marginTop: 0 }}>Provision SIM</h2>
+    <Dialog open title="Provision SIM" onClose={onClose}>
         <div className="mono" style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 16, lineHeight: 1.6 }}>
           Reader {card.index}: {card.name}<br />
           ICCID: {card.iccid || '—'}<br />
           IMSI: {card.imsi || '—'}
         </div>
         <div style={{ display: 'grid', gap: 12 }}>
-          <div><label>Name</label><input value={f.name} onChange={(e) => upd({ name: e.target.value })} placeholder="auto (MCC-MNC)" /></div>
+          <div><label htmlFor="prov-name">Name</label><input id="prov-name" value={f.name} onChange={(e) => upd({ name: e.target.value })} placeholder="auto (MCC-MNC)" /></div>
           {needPin && (
-            <div><label>SIM PIN (CHV1) — {pinProp ? 'verified ✓, re-confirm if needed' : 'required'}</label>
-              <input type="password" inputMode="numeric" className="mono" value={f.pin} maxLength={8}
+            <div><label htmlFor="prov-pin">SIM PIN (CHV1) — {pinProp ? 'verified ✓, re-confirm if needed' : 'required'}</label>
+              <input id="prov-pin" type="password" inputMode="numeric" className="mono" value={f.pin} maxLength={8}
                 onChange={(e) => upd({ pin: e.target.value.replace(/[^0-9]/g, '') })} placeholder="4–8 digits" /></div>
           )}
-          <div><label>IMEI — required</label><input className="mono" value={f.imei} onChange={(e) => upd({ imei: e.target.value })} placeholder="35123456-789012-3" /></div>
-          <div><label>IMEISV — optional</label><input className="mono" value={f.imeisv} onChange={(e) => upd({ imeisv: e.target.value.replace(/[^0-9]/g, '') })} maxLength={16} placeholder="auto from IMEI + random SVN" />
-            <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>16 digits, for the carrier's DEVICE_IDENTITY request. Leave blank to auto-generate (14-digit IMEI + 2-digit software version).</div>
+          <div><label htmlFor="prov-imei">IMEI — required</label><input id="prov-imei" className="mono" value={f.imei} onChange={(e) => upd({ imei: e.target.value })} placeholder="35123456-789012-3" /></div>
+          <div><label htmlFor="prov-imeisv">IMEISV — optional</label><input id="prov-imeisv" className="mono" value={f.imeisv} onChange={(e) => upd({ imeisv: e.target.value.replace(/[^0-9]/g, '') })} maxLength={16} placeholder="auto from IMEI + random SVN" />
+            <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>16 digits, for the carrier&apos;s DEVICE_IDENTITY request. Leave blank to auto-generate (14-digit IMEI + 2-digit software version).</div>
           </div>
 
           <div>
             <label>SMS centre (SMSC)</label>
-            <div style={{ display: 'flex', gap: 16, margin: '6px 0' }}>
+            <div style={{ display: 'flex', gap: 16, margin: '6px 0', flexWrap: 'wrap' }}>
               {radio('auto', 'Auto (from SIM)')}
               {radio('manual', 'Manual')}
             </div>
             {f.smscMode === 'auto'
-              ? <div className="mono" style={{ fontSize: 12, color: simSmsc ? 'var(--text-soft)' : '#eab308' }}>
+              ? <div className="mono" style={{ fontSize: 12, color: simSmsc ? 'var(--text-soft)' : 'var(--warning)' }}>
                   {simSmsc ? `${simSmsc} — read from SIM` : '⚠ SIM did not provide an SMSC; choose Manual'}
                 </div>
-              : <input className="mono" value={f.smscManual} onChange={(e) => upd({ smscManual: e.target.value })} placeholder="+1..." />}
+              : <input className="mono" value={f.smscManual} onChange={(e) => upd({ smscManual: e.target.value })} placeholder="+1..." aria-label="Manual SMSC" />}
           </div>
 
-          <div><label>Device User-Agent (how the line identifies to the carrier)</label><input className="mono" value={f.user_agent} onChange={(e) => upd({ user_agent: e.target.value })} placeholder="iOS/26.6 iPhone" /></div>
+          <div><label htmlFor="prov-ua">Device User-Agent (how the line identifies to the carrier)</label><input id="prov-ua" className="mono" value={f.user_agent} onChange={(e) => upd({ user_agent: e.target.value })} placeholder="iOS/26.6 iPhone" /></div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <div><label>APN</label>
-              <input className="mono" value={f.apn} onChange={(e) => upd({ apn: e.target.value })} placeholder="ims" />
+          <div className="form-grid">
+            <div><label htmlFor="prov-apn">APN</label>
+              <input id="prov-apn" className="mono" value={f.apn} onChange={(e) => upd({ apn: e.target.value })} placeholder="ims" />
               <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>VoWiFi access point. Default <code>ims</code>.</div>
             </div>
-            <div><label>ePDG identity (IDr)</label>
-              <select value={f.idrMode} onChange={(e) => upd({ idrMode: e.target.value })}>
+            <div><label htmlFor="prov-idr">ePDG identity (IDr)</label>
+              <select id="prov-idr" value={f.idrMode} onChange={(e) => upd({ idrMode: e.target.value })}>
                 <option value="apn">Bare APN (default)</option>
                 <option value="fqdn">APN-FQDN</option>
               </select>
               <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>How the APN is sent to the ePDG. Most carriers expect the bare APN; a few stricter ones require the full APN-FQDN.</div>
             </div>
-            <div><label>IMS address family (CP)</label>
-              <select value={f.cpMode} onChange={(e) => upd({ cpMode: e.target.value })}>
+            <div><label htmlFor="prov-cp">IMS address family (CP)</label>
+              <select id="prov-cp" value={f.cpMode} onChange={(e) => upd({ cpMode: e.target.value })}>
                 <option value="auto">Auto-detect (recommended)</option>
                 <option value="dual">Dual-stack (IPv4+IPv6)</option>
                 <option value="v6">IPv6 only</option>
                 <option value="v4">IPv4 only</option>
               </select>
-              <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>Address family of the IMS PDN. <b>Auto</b> discovers it for you (matches known carriers, else probes) — leave this unless you know the carrier needs a specific family. Telus/EE are IPv6; Vodafone UK is IPv4.</div>
+              <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>Address family of the IMS PDN. <b>Auto</b> discovers it for you — leave this unless you know the carrier needs a specific family.</div>
             </div>
           </div>
 
           <div>
             <label>Local SIP port mapping</label>
-            <div style={{ display: 'flex', gap: 16, margin: '6px 0' }}>
+            <div style={{ display: 'flex', gap: 16, margin: '6px 0', flexWrap: 'wrap' }}>
               <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
                 <input type="radio" name="portMode" checked={f.portMode === 'auto'}
                   onChange={() => { upd({ portMode: 'auto' }); setErr('') }} style={{ width: 'auto' }} />
@@ -164,37 +162,36 @@ export default function ProvisionModal({ card, pin: pinProp, onClose, onDone }) 
                             : 'Picks the next free host port automatically.'}
                 </div>
               : <>
-                  <input type="number" className="mono" value={f.sipPort} min={portMin} max={portMax}
+                  <input type="number" className="mono" value={f.sipPort} min={portMin} max={portMax} aria-label="SIP port"
                     onChange={(e) => { upd({ sipPort: e.target.value.replace(/[^0-9]/g, '') }); setErr('') }}
                     placeholder={String(autoPort?.auto_sip_udp || '5060')} />
-                  <div style={{ fontSize: 11.5, color: f.sipPort && !portOk ? '#ef4444' : 'var(--text-mute)', marginTop: 4 }}>
+                  <div style={{ fontSize: 11.5, color: f.sipPort && !portOk ? 'var(--danger)' : 'var(--text-mute)', marginTop: 4 }}>
                     {f.sipPort && !portOk
                       ? `Enter a valid port (${portMin}–${portMax}).`
-                      : `SIP UDP port on the host (${portMin}–${portMax}). TLS uses this +1; WebRTC/RTP derive from it. Checked for conflicts on submit.`}
+                      : `SIP UDP port on the host (${portMin}–${portMax}). TLS uses this +1; WebRTC/RTP derive from it.`}
                   </div>
                 </>}
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <div><label>SIP listen</label>
-              <select value={f.listen_addr} onChange={(e) => upd({ listen_addr: e.target.value })}>
+          <div className="form-grid">
+            <div><label htmlFor="prov-listen">SIP listen</label>
+              <select id="prov-listen" value={f.listen_addr} onChange={(e) => upd({ listen_addr: e.target.value })}>
                 <option value="0.0.0.0">0.0.0.0 (all)</option><option value="127.0.0.1">127.0.0.1</option>
               </select></div>
-            <div><label>SIP transport</label>
-              <select value={f.transport} onChange={(e) => upd({ transport: e.target.value })}>
+            <div><label htmlFor="prov-transport">SIP transport</label>
+              <select id="prov-transport" value={f.transport} onChange={(e) => upd({ transport: e.target.value })}>
                 <option value="udp">UDP</option><option value="tcp">TCP</option><option value="tls">TLS</option>
               </select></div>
           </div>
           <label><input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={f.webrtc} onChange={(e) => upd({ webrtc: e.target.checked })} />Enable browser softphone (WebRTC)</label>
         </div>
-        {err && <div style={{ color: '#ef4444', fontSize: 13, marginTop: 12 }}>{err}</div>}
+        {err && <div style={{ color: 'var(--danger)', fontSize: 13, marginTop: 12 }} role="alert">{err}</div>}
         <div style={{ display: 'flex', gap: 8, marginTop: 20, justifyContent: 'flex-end' }}>
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" onClick={submit} disabled={busy || !f.imei || !pinOk || !manualOk || !portOk}>
+          <button type="button" className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button type="button" className="btn btn-primary" onClick={submit} disabled={busy || !f.imei || !pinOk || !manualOk || !portOk}>
             {busy ? 'Provisioning…' : 'Provision & start'}
           </button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }

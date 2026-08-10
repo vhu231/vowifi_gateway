@@ -1,12 +1,18 @@
 # runtime data: config, per-instance state, SQLite DB, logs, certs, saved PINs/secrets
 data/*
 !data/.gitkeep
+# cwd-relative spill if control is started from control/ without VOWIFI_DATA
+control/data/
 
 # build artifacts
 **/__pycache__/
 *.pyc
 node_modules/
 webui/dist/
+
+# local-only test suites (run on the machine that owns them; not shipped)
+webui/tests/
+control/tests/
 
 # Python venv (native/local control-plane install)
 .venv/

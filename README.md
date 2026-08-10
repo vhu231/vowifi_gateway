@@ -74,6 +74,16 @@ Accept the self-signed cert, then **provision your SIM** in the dashboard:
 3. The engine container spins up and walks the state machine: `TUNNEL_DOWN` → `REGISTERING` → `OK` (IMS registered)
 4. Once `OK`, the **Softphone** tab lets you dial out from the browser; external SIP clients connect to `<host-ip>:5060` (UDP) or `:5061` (TLS) / `:8089` (WebRTC/WSS)
 
+### Web access password (optional)
+
+By default the control-plane WebUI / REST API / live WebSocket are **open** (no login) — matching previous releases. To lock them down:
+
+1. Open **Settings → Web access** and set a password (or export `VOWIFI_WEB_PASSWORD` before starting the control plane).
+2. After a password is set, browsers must sign in. A successful login stores an **HttpOnly / SameSite=Strict / Secure (HTTPS)** cookie for **30 days**.
+3. Multiple devices can stay signed in independently. **Sign out** clears only that device's cookie. **Changing or clearing** the password (or changing `VOWIFI_WEB_PASSWORD` + restart) invalidates every cookie immediately and closes live WebSockets.
+4. Engine → control callbacks (`/api/engine/event`) do **not** use the Web cookie; they use a separate `X-Vowifi-Engine-Token` injected into each engine container on start/reprovision (`reload` recreates engines, so they always carry the token).
+5. If you put the WebUI behind a reverse proxy, forward `Host` / `Origin` / `X-Forwarded-Proto` (and ideally the real client IP) so CSRF checks and Secure cookies keep working.
+
 ---
 
 ## Configuration
@@ -87,6 +97,7 @@ Set via **env vars** (or a `.env` file next to `install.sh`) before running `ins
 | `VOWIFI_DATA_DIR` | `<repo>/data` | Runtime data directory (config, logs, DB, certs) |
 | `VOWIFI_ADVERTISE_ADDR` | auto-detect | Host LAN IP advertised to SIP/WebRTC clients for RTP (auto-detect uses `ip route get` or `hostname -I`; override if your host is multi-homed or the auto-detect picks the wrong NIC) |
 | `VOWIFI_BIND` | `0.0.0.0` | Bind address for the control plane (rarely changed) |
+| `VOWIFI_WEB_PASSWORD` | _(empty)_ | Optional WebUI/API password. When set, overrides any password stored in Settings and forces login. Clear + restart to return control to the WebUI Settings page. |
 | `PCSC_VERSION` | `2.3.3` | pcsc-lite version pinned across host + all images |
 
 Example:

@@ -1,8 +1,10 @@
 // Browser softphone: JsSIP UA over WSS to the engine's Asterisk WebRTC transport.
 import JsSIP from 'jssip'
 
-// Surface JsSIP internals in the console to aid troubleshooting (registration, ICE, etc.)
-try { JsSIP.debug.enable('JsSIP:*') } catch {}
+// Dev-only JsSIP tracing — keep production consoles quiet.
+if (import.meta.env.DEV) {
+  try { JsSIP.debug.enable('JsSIP:*') } catch {}
+}
 
 export class Softphone {
   // audioEl: a persistent <audio> element rendered by React and handed in via ref. Using one

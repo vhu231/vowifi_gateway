@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { api } from '../api.js'
+import Dialog from '../components/Dialog.jsx'
 
 // Connection parameters for a STANDARD SIP client (not the browser WebRTC softphone).
 // Maps 1:1 to the fields a generic SIP softphone asks for:
@@ -42,36 +43,33 @@ export default function SipInfoModal({ instance, onClose, setView, setSelected }
   const acct = info?.accounts?.[0]
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: '#000a', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50 }}
-      onClick={onClose}>
-      <div className="card" style={{ padding: 24, width: 520, maxWidth: '92vw', maxHeight: '92vh', overflow: 'auto' }} onClick={(e) => e.stopPropagation()}>
-        <h2 style={{ marginTop: 0 }}>SIP client connection info</h2>
+    <Dialog open title="SIP client connection info" onClose={onClose}>
         <div style={{ fontSize: 12.5, color: 'var(--text-dim)', marginBottom: 16, lineHeight: 1.6 }}>
           Register a standard SIP softphone to this line ({instance.name || instance.imsi}). Incoming
           calls/SMS ring your SIP client, and numbers you dial go out over VoWiFi.
         </div>
 
-        {err && <div style={{ color: '#ef4444', fontSize: 13 }}>{err}</div>}
-        {!info && !err && <div style={{ color: 'var(--text-mute)' }}>Loading…</div>}
+        {err && <div style={{ color: 'var(--danger)', fontSize: 13 }} role="alert">{err}</div>}
+        {!info && !err && <div style={{ color: 'var(--text-mute)' }} role="status">Loading…</div>}
 
         {info && (
           <>
             {!info.running && (
               <div style={{ marginBottom: 14, padding: '8px 11px', borderRadius: 8, fontSize: 12.5,
-                background: 'rgba(234,179,8,.12)', border: '1px solid rgba(234,179,8,.4)', color: 'var(--text-soft)' }}>
-                This line isn't running — start it before registering a SIP client.
+                background: 'color-mix(in srgb, var(--warning) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--warning) 40%, transparent)', color: 'var(--text-soft)' }}>
+                This line isn&apos;t running — start it before registering a SIP client.
               </div>
             )}
 
             {!acct ? (
-              <div style={{ padding: '14px 16px', borderRadius: 10, background: 'rgba(234,179,8,.12)',
-                border: '1px solid rgba(234,179,8,.4)', fontSize: 13, lineHeight: 1.6 }}>
+              <div style={{ padding: '14px 16px', borderRadius: 10, background: 'color-mix(in srgb, var(--warning) 12%, transparent)',
+                border: '1px solid color-mix(in srgb, var(--warning) 40%, transparent)', fontSize: 13, lineHeight: 1.6 }}>
                 <b>No SIP account configured for this line yet.</b><br />
                 A SIP client needs a username + password. Add one under{' '}
-                <a style={{ cursor: 'pointer', textDecoration: 'underline' }}
+                <button type="button" className="btn btn-ghost btn-sm" style={{ display: 'inline', padding: 0, minHeight: 0, textDecoration: 'underline' }}
                   onClick={() => { setSelected && setSelected(instance.id); setView && setView('sims'); onClose() }}>
                   SIM Config → External SIP accounts
-                </a>, save, then reopen this dialog.
+                </button>, save, then reopen this dialog.
               </div>
             ) : (
               <>
@@ -83,7 +81,7 @@ export default function SipInfoModal({ instance, onClose, setView, setSelected }
                   hint="Username for authentication. If empty, Username is used — they're the same here." />
                 <Field label="Password" value={acct.password}
                   hint="Your account password." />
-                <div style={{ display: 'flex', gap: 12 }}>
+                <div style={{ display: 'flex', gap: 12 }} className="form-grid">
                   <div style={{ flex: 1 }}><Field label="Port" value={info.port}
                     hint="This line's port. Already included in Domain above; set it here too if your client has a separate port field." /></div>
                   <div style={{ flex: 1 }}><Field label="Transport" value={String(info.transport).toUpperCase()} /></div>
@@ -99,7 +97,7 @@ export default function SipInfoModal({ instance, onClose, setView, setSelected }
 
                 {info.msisdn &&
                   <div style={{ fontSize: 12, color: 'var(--text-mute)', marginTop: 6 }}>
-                    This line's own number: <span className="mono">{info.msisdn}</span>
+                    This line&apos;s own number: <span className="mono">{info.msisdn}</span>
                   </div>}
               </>
             )}
@@ -107,9 +105,8 @@ export default function SipInfoModal({ instance, onClose, setView, setSelected }
         )}
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 20 }}>
-          <button className="btn btn-primary" onClick={onClose}>Close</button>
+          <button type="button" className="btn btn-primary" onClick={onClose}>Close</button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }

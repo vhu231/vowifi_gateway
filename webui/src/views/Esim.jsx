@@ -157,7 +157,7 @@ function seTarget(reader, se) {
   }
 }
 
-function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast }) {
+function DownloadModal({ reader, ses, imeiDefault, onClose, onStarted, showToast: _showToast }) {
   const dual = (ses || []).length > 1
   const [mode, setMode] = useState('code') // code | manual
   const [activation, setActivation] = useState('')

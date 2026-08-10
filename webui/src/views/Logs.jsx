@@ -42,15 +42,16 @@ export default function Logs({ selected, instances, cards, setSelected }) {
   const [logs, setLogs] = useState({ engine: '', charon: '' })
   const [tab, setTab] = useState('engine')
   const [auto, setAuto] = useState(true)
+  const [err, setErr] = useState(null)
 
   const load = useCallback(async () => {
     if (!id) return
-    try { setLogs(await api.logs(id, 400)) } catch {}
+    try { setLogs(await api.logs(id, 400)); setErr(null) } catch (e) { setErr(e.message || 'Failed to load logs') }
   }, [id])
 
   useEffect(() => { load() }, [load])
   useEffect(() => {
-    if (!auto) return
+    if (!auto) return undefined
     const t = setInterval(load, 3000)
     return () => clearInterval(t)
   }, [auto, load])
@@ -67,21 +68,27 @@ export default function Logs({ selected, instances, cards, setSelected }) {
   return (
     <div>
       <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} label="Show logs for" />
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12, alignItems: 'center' }}>
+      {err && (
+        <div style={{ color: 'var(--danger)', marginBottom: 10, fontSize: 13 }} role="alert">
+          {err}{' '}
+          <button type="button" className="btn btn-ghost btn-sm" onClick={load}>Retry</button>
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12, alignItems: 'center', flexWrap: 'wrap' }}>
         {['engine', 'charon'].map((t) => (
-          <button key={t} className={`btn ${tab === t ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab(t)}>
+          <button key={t} type="button" className={`btn ${tab === t ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab(t)}>
             {t === 'engine' ? 'Asterisk / engine' : 'SWu tunnel (IKE)'}
           </button>
         ))}
-        <button className="btn btn-ghost" onClick={load}>Refresh</button>
+        <button type="button" className="btn btn-ghost" onClick={load}>Refresh</button>
         <label style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
           <input type="checkbox" style={{ width: 'auto' }} checked={auto} onChange={(e) => setAuto(e.target.checked)} /> auto
         </label>
       </div>
       <pre className="mono card" style={{
         padding: 16, fontSize: 12, lineHeight: 1.5, overflow: 'auto',
-        height: 'calc(100vh - 200px)', whiteSpace: 'pre-wrap', color: 'var(--text-soft)',
-        background: 'var(--input-bg)',
+        height: 'min(70vh, calc(100dvh - 220px))', whiteSpace: 'pre-wrap', color: 'var(--text-soft)',
+        background: 'var(--input-bg)', maxWidth: '100%',
       }}>
         {rendered}
       </pre>

@@ -63,6 +63,17 @@ DEFAULTS = {
             "download_timeout": 300,
             "auto_process_notifications": True,
         },
+        # Optional WebUI / API password. Empty password_hash = no login required.
+        # VOWIFI_WEB_PASSWORD env overrides the stored hash when set (non-empty).
+        # session_secret / engine_token / credential_version are generated lazily and
+        # must never be returned by the public settings API.
+        "auth": {
+            "password_hash": "",
+            "session_secret": "",
+            "engine_token": "",
+            "credential_version": 1,
+            "env_password_fp": "",  # sha256 prefix of VOWIFI_WEB_PASSWORD; bump version on change
+        },
     },
     "instances": {},
 }
@@ -149,6 +160,8 @@ def load() -> dict:
             out["settings"][key] = merged
         esim_saved = data.get("settings", {}).get("esim", {}) or {}
         out["settings"]["esim"] = {**DEFAULTS["settings"]["esim"], **esim_saved}
+        auth_saved = data.get("settings", {}).get("auth", {}) or {}
+        out["settings"]["auth"] = {**DEFAULTS["settings"]["auth"], **auth_saved}
         out["instances"] = data.get("instances", {})
         return out
 
@@ -174,11 +187,175 @@ def get_settings() -> dict:
     return load()["settings"]
 
 
+def public_settings() -> dict:
+    """Settings safe to return over the HTTP API (no password hash / secrets)."""
+    s = deepcopy(get_settings())
+    auth = s.get("auth") or {}
+    env_pw = (os.environ.get("VOWIFI_WEB_PASSWORD") or "").strip()
+    s["auth"] = {
+        "enabled": bool(env_pw) or bool((auth.get("password_hash") or "").strip()),
+        "managed_by_env": bool(env_pw),
+    }
+    return s
+
+
 def update_settings(patch: dict) -> dict:
+    """Merge a settings patch. Strips `auth` so the generic settings PUT cannot
+    overwrite hashes/secrets; use set_web_password / clear_web_password instead."""
     data = load()
+    patch = dict(patch or {})
+    patch.pop("auth", None)
+    preserved_auth = data["settings"].get("auth")
     data["settings"].update(patch)
+    if preserved_auth is not None:
+        data["settings"]["auth"] = preserved_auth
     save(data)
-    return data["settings"]
+    return public_settings()
+
+
+def _auth_blob(data: dict | None = None) -> dict:
+    if data is None:
+        data = load()
+    auth = data["settings"].setdefault("auth", {})
+    for k, v in DEFAULTS["settings"]["auth"].items():
+        auth.setdefault(k, v)
+    return auth
+
+
+def ensure_auth_secrets() -> dict:
+    """Ensure session_secret + engine_token exist (persist if generated).
+
+    Also detects VOWIFI_WEB_PASSWORD changes across restarts and bumps
+    credential_version so old cookies die immediately."""
+    import hashlib
+    with _lock:
+        data = load()
+        auth = _auth_blob(data)
+        dirty = False
+        if not (auth.get("session_secret") or "").strip():
+            auth["session_secret"] = secrets.token_urlsafe(32)
+            dirty = True
+        if not (auth.get("engine_token") or "").strip():
+            auth["engine_token"] = secrets.token_urlsafe(32)
+            dirty = True
+        if not auth.get("credential_version"):
+            auth["credential_version"] = 1
+            dirty = True
+        env_pw = (os.environ.get("VOWIFI_WEB_PASSWORD") or "").strip()
+        fp = hashlib.sha256(env_pw.encode("utf-8")).hexdigest()[:16] if env_pw else ""
+        prev_fp = auth.get("env_password_fp") or ""
+        if fp != prev_fp:
+            auth["env_password_fp"] = fp
+            if prev_fp or fp:
+                # Password appeared, changed, or was removed via env — invalidate sessions.
+                auth["credential_version"] = int(auth.get("credential_version") or 1) + 1
+            dirty = True
+        data["settings"]["auth"] = auth
+        if dirty:
+            save(data)
+        return dict(auth)
+
+
+def get_auth() -> dict:
+    """Internal auth state (includes secrets). Callers must not expose this."""
+    return ensure_auth_secrets()
+
+
+def auth_enabled() -> bool:
+    env_pw = (os.environ.get("VOWIFI_WEB_PASSWORD") or "").strip()
+    if env_pw:
+        return True
+    return bool((get_auth().get("password_hash") or "").strip())
+
+
+def auth_managed_by_env() -> bool:
+    return bool((os.environ.get("VOWIFI_WEB_PASSWORD") or "").strip())
+
+
+def effective_password_check(password: str) -> bool:
+    """Verify a plaintext password against env override or stored hash."""
+    from . import auth as auth_mod
+    env_pw = (os.environ.get("VOWIFI_WEB_PASSWORD") or "").strip()
+    if env_pw:
+        return hmac_compare(password, env_pw)
+    stored = (get_auth().get("password_hash") or "").strip()
+    if not stored:
+        return False
+    return auth_mod.verify_password(password, stored)
+
+
+def hmac_compare(a: str, b: str) -> bool:
+    """Constant-time string compare via SHA-256 digests (length-independent)."""
+    import hashlib
+    import hmac as _hmac
+    return _hmac.compare_digest(
+        hashlib.sha256((a or "").encode("utf-8")).digest(),
+        hashlib.sha256((b or "").encode("utf-8")).digest(),
+    )
+
+
+def credential_version() -> int:
+    return int(get_auth().get("credential_version") or 1)
+
+
+def bump_credential_version() -> int:
+    with _lock:
+        data = load()
+        auth = _auth_blob(data)
+        auth["credential_version"] = int(auth.get("credential_version") or 1) + 1
+        data["settings"]["auth"] = auth
+        save(data)
+        return int(auth["credential_version"])
+
+
+def set_web_password(password: str) -> dict:
+    """Hash + store a new Web password; rotate credential version. Refuses when
+    VOWIFI_WEB_PASSWORD is set (env wins)."""
+    from . import auth as auth_mod
+    if auth_managed_by_env():
+        raise ValueError("password is managed by VOWIFI_WEB_PASSWORD")
+    password = password or ""
+    if not password.strip():
+        raise ValueError("password must not be empty; use clear_web_password()")
+    with _lock:
+        data = load()
+        auth = _auth_blob(data)
+        if not (auth.get("session_secret") or "").strip():
+            auth["session_secret"] = secrets.token_urlsafe(32)
+        if not (auth.get("engine_token") or "").strip():
+            auth["engine_token"] = secrets.token_urlsafe(32)
+        auth["password_hash"] = auth_mod.hash_password(password)
+        auth["credential_version"] = int(auth.get("credential_version") or 1) + 1
+        data["settings"]["auth"] = auth
+        save(data)
+        return {
+            "enabled": True,
+            "managed_by_env": False,
+            "credential_version": auth["credential_version"],
+        }
+
+
+def clear_web_password() -> dict:
+    """Remove the stored password (open access). Rotates credential version so
+    existing cookies die immediately. Refuses when env-managed."""
+    if auth_managed_by_env():
+        raise ValueError("password is managed by VOWIFI_WEB_PASSWORD")
+    with _lock:
+        data = load()
+        auth = _auth_blob(data)
+        auth["password_hash"] = ""
+        auth["credential_version"] = int(auth.get("credential_version") or 1) + 1
+        data["settings"]["auth"] = auth
+        save(data)
+        return {
+            "enabled": False,
+            "managed_by_env": False,
+            "credential_version": auth["credential_version"],
+        }
+
+
+def engine_callback_token() -> str:
+    return (get_auth().get("engine_token") or "").strip()
 
 
 def list_instances() -> list:
@@ -608,6 +785,9 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         "manager_url": settings.get("manager_url")
                        or os.environ.get("VOWIFI_MANAGER_URL")
                        or f"https://host.docker.internal:{settings.get('http_port', 8443)}",
+        # Shared secret for engine → control /api/engine/event callbacks. notify.py sends
+        # it as X-Vowifi-Engine-Token; control rejects callbacks without a matching token.
+        "engine_token": engine_callback_token(),
         "domain": settings.get("tls", {}).get("domain", ""),
         "rtp_start": ports["rtp_start"],
         # The engine publishes only rtp_start..rtp_start+RTP_SPAN-1 host ports (engine.start),

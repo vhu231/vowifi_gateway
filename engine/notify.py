@@ -52,8 +52,12 @@ def main():
         import requests
         import urllib3
         urllib3.disable_warnings()
+        headers = {}
+        token = os.environ.get("ENGINE_TOKEN") or env.get("ENGINE_TOKEN", "")
+        if token:
+            headers["X-Vowifi-Engine-Token"] = token
         requests.post(f"{manager_url.rstrip('/')}/api/engine/event",
-                      json=payload, timeout=3, verify=False)
+                      json=payload, headers=headers, timeout=3, verify=False)
     except Exception:
         pass
 

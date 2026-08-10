@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { api } from '../api.js'
 import SimSelector from './SimSelector.jsx'
+import { Field } from '../components/Field.jsx'
 
 const PANI_ACCESS_TYPES = [
   'IEEE-802.11', 'IEEE-802.11a', 'IEEE-802.11b', 'IEEE-802.11g', 'IEEE-802.11n',
@@ -32,10 +33,6 @@ const emptyInstance = () => ({
   },
   debug: { asterisk: true, charon: false },
 })
-
-function Field({ label, children }) {
-  return <div><label>{label}</label>{children}</div>
-}
 
 function normalizePreviewCountry(c) {
   const s = String(c || '').trim().toUpperCase().replace(/[^A-Z]/g, '')
@@ -192,7 +189,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
     <div style={{ maxWidth: 1000 }}>
       {instances.length > 1 &&
         <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} label="Configuring line" />}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+      <div className="form-grid-lg">
       {/* Card / PIN panel */}
       <div className="card" style={{ padding: 20 }}>
         <h3 style={{ marginTop: 0 }}>SIM card</h3>
@@ -238,7 +235,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       {/* Instance form */}
       <div className="card" style={{ padding: 20 }}>
         <h3 style={{ marginTop: 0 }}>Line configuration</h3>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div className="form-grid">
           <Field label="Instance ID"><input value={form.id} onChange={(e) => upd({ id: e.target.value })} placeholder="1" /></Field>
           <Field label="Name"><input value={form.name} onChange={(e) => upd({ name: e.target.value })} placeholder="Telus" /></Field>
           <Field label="IMSI"><input className="mono" value={form.imsi} onChange={(e) => upd({ imsi: e.target.value })} /></Field>
@@ -247,14 +244,14 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           <Field label="IMEI"><input className="mono" value={form.imei} onChange={(e) => upd({ imei: e.target.value })} placeholder="35123456-789012-3" /></Field>
           <Field label="IMEISV"><input className="mono" value={form.imeisv || ''} onChange={(e) => upd({ imeisv: e.target.value.replace(/[^0-9]/g, '') })} maxLength={16} placeholder="auto from IMEI (DEVICE_IDENTITY)" /></Field>
           <Field label="Phone number (MSISDN)"><input className="mono" value={form.msisdn} onChange={(e) => upd({ msisdn: e.target.value })} placeholder="auto-learned" /></Field>
-          <Field label="SMS centre (SMSC)">
-            <div style={{ display: 'flex', gap: 12, marginBottom: 6, fontSize: 13 }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
-                <input type="radio" name="scmode" checked={smscMode === 'auto'} style={{ width: 'auto' }}
+          <Field label="SMS centre (SMSC)" className="form-span-2">
+            <div className="choice-row">
+              <label>
+                <input type="radio" name="scmode" checked={smscMode === 'auto'}
                   onChange={() => { setSmscMode('auto'); if (card?.smsc) upd({ smsc: card.smsc }) }} />Auto (from SIM)
               </label>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
-                <input type="radio" name="scmode" checked={smscMode === 'manual'} style={{ width: 'auto' }}
+              <label>
+                <input type="radio" name="scmode" checked={smscMode === 'manual'}
                   onChange={() => setSmscMode('manual')} />Manual
               </label>
             </div>
@@ -265,13 +262,13 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           </Field>
           <Field label="Reader match"><input className="mono" value={form.reader} onChange={(e) => upd({ reader: e.target.value })} placeholder="imsi:302..." /></Field>
           <Field label="APN"><input className="mono" value={form.apn ?? 'ims'} onChange={(e) => upd({ apn: e.target.value })} placeholder="ims" /></Field>
-          <Field label="ePDG identity (IDr)">
+          <Field label="ePDG identity (IDr)" className="form-span-2">
             <select value={form.idr_mode ?? 'apn'} onChange={(e) => upd({ idr_mode: e.target.value })}>
               <option value="apn">Bare APN (default)</option>
               <option value="fqdn">APN-FQDN</option>
             </select>
           </Field>
-          <Field label="IMS address family (CP)">
+          <Field label="IMS address family (CP)" className="form-span-2">
             <select value={form.cp_mode ?? 'auto'} onChange={(e) => upd({ cp_mode: e.target.value })}>
               <option value="auto">Auto-detect (recommended)</option>
               <option value="dual">Dual-stack (IPv4+IPv6)</option>
@@ -286,24 +283,24 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           </Field>
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
-          IDr is how the APN is presented to the ePDG. <b>Bare APN</b> (just the APN string) is what most carriers' ePDGs expect and is the safe default; <b>APN-FQDN</b> (<code>&lt;apn&gt;.apn.epc.mnc…mcc….pub.3gppnetwork.org</code>) is required only by a few stricter carriers — some networks reject it.
+          IDr is how the APN is presented to the ePDG. <b>Bare APN</b> (just the APN string) is what most carriers&apos; ePDGs expect and is the safe default; <b>APN-FQDN</b> (<code>&lt;apn&gt;.apn.epc.mnc…mcc….pub.3gppnetwork.org</code>) is required only by a few stricter carriers — some networks reject it.
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
-          <b>IMS address family</b> must match the carrier's IMS PDN. <b>Auto-detect</b> figures it out for you (matches known carriers, else probes families after SIM auth) and pins the one that works — leave this unless you know the carrier needs a specific family. Telus/EE are IPv6; Vodafone UK is IPv4.
+          <b>IMS address family</b> must match the carrier&apos;s IMS PDN. <b>Auto-detect</b> figures it out for you (matches known carriers, else probes families after SIM auth) and pins the one that works — leave this unless you know the carrier needs a specific family. Telus/EE are IPv6; Vodafone UK is IPv4.
         </div>
 
-        <label style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
-          <input type="checkbox" style={{ width: 'auto' }}
+        <label style={{ marginTop: 10 }}>
+          <input type="checkbox"
             checked={form.use_reauth_id !== false}
             onChange={(e) => upd({ use_reauth_id: e.target.checked })} />
           Use EAP-AKA fast re-authentication
         </label>
         <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 4 }}>
-          On by default. After a successful attach the carrier's AAA may hand out a short-lived re-authentication identity; presenting it on a reconnect lets the network skip a full SIM auth run. If it has expired the engine notices the rejection and retries with the permanent IMSI identity by itself, so this is safe to leave on. Turn it <b>off</b> for a carrier whose AAA rejects it on every reconnect (O2 UK) to skip that wasted attach attempt.
+          On by default. After a successful attach the carrier&apos;s AAA may hand out a short-lived re-authentication identity; presenting it on a reconnect lets the network skip a full SIM auth run. If it has expired the engine notices the rejection and retries with the permanent IMSI identity by itself, so this is safe to leave on. Turn it <b>off</b> for a carrier whose AAA rejects it on every reconnect (O2 UK) to skip that wasted attach attempt.
         </div>
 
         <h4 style={{ marginBottom: 6 }}>Local SIP access</h4>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div className="form-grid">
           <Field label="Listen address">
             <select value={form.sip.listen_addr} onChange={(e) => updSip({ listen_addr: e.target.value })}>
               <option value="0.0.0.0">0.0.0.0 (all)</option>
@@ -318,7 +315,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           </Field>
         </div>
         <label style={{ marginTop: 8 }}>
-          <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={!!form.sip.webrtc?.enable}
+          <input type="checkbox" checked={!!form.sip.webrtc?.enable}
             onChange={(e) => updSip({ webrtc: { ...form.sip.webrtc, enable: e.target.checked } })} />
           Enable browser softphone (WebRTC)
         </label>
@@ -339,8 +336,8 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
             {PANI_ACCESS_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
           </select>
         </Field>
-        <label style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
-          <input type="checkbox" style={{ width: 'auto' }}
+        <label style={{ marginTop: 10 }}>
+          <input type="checkbox"
             checked={form.sip.pani_country_enable !== false}
             onChange={(e) => updSip({ pani_country_enable: e.target.checked })} />
           Report country code
@@ -353,8 +350,8 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
               placeholder="留空 = 按 SIM 的 MCC 自动推导（如 GB）" />
           </div>
         )}
-        <label style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
-          <input type="checkbox" style={{ width: 'auto' }}
+        <label style={{ marginTop: 10 }}>
+          <input type="checkbox"
             checked={!!form.sip.pani_node_id_enable}
             onChange={(e) => updSip({ pani_node_id_enable: e.target.checked })} />
           Report Wi-Fi AP BSSID (i-wlan-node-id)
@@ -375,7 +372,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         <div style={{ marginTop: 12 }}>
           <label>External SIP accounts</label>
           {(form.sip.external || []).map((a, i) => (
-            <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+            <div key={i} className="row-2">
               <input placeholder="username" value={a.username} onChange={(e) => setAccount(i, 'username', e.target.value)} />
               <input placeholder="password" value={a.password} onChange={(e) => setAccount(i, 'password', e.target.value)} />
             </div>

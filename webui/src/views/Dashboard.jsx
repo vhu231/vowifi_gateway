@@ -3,10 +3,49 @@ import { api } from '../api.js'
 import ProvisionModal from './ProvisionModal.jsx'
 import SipInfoModal from './SipInfoModal.jsx'
 
+function Kv({ k, children, mono, title, truncate = true, onCopy }) {
+  const text = (title || (typeof children === 'string' ? children : '') || '').trim()
+  const copyable = !!(mono && text && text !== '—')
+  const doTruncate = truncate && !mono
+
+  const copy = async (e) => {
+    if (!copyable) return
+    e.preventDefault()
+    e.stopPropagation()
+    try {
+      await navigator.clipboard.writeText(text)
+      onCopy?.(k, text)
+    } catch {
+      onCopy?.(k, null)
+    }
+  }
+
+  return (
+    <>
+      <span className="kv-k">{k}</span>
+      <span
+        className={[
+          'kv-v',
+          mono ? 'mono' : '',
+          doTruncate ? 'truncate' : '',
+          copyable ? 'is-copyable' : '',
+        ].filter(Boolean).join(' ')}
+        title={copyable ? `${text} — tap to copy` : title}
+        role={copyable ? 'button' : undefined}
+        tabIndex={copyable ? 0 : undefined}
+        onClick={copyable ? copy : undefined}
+        onKeyDown={copyable ? (e) => { if (e.key === 'Enter' || e.key === ' ') copy(e) } : undefined}
+      >
+        {children}
+      </span>
+    </>
+  )
+}
+
 function StateBadge({ st }) {
   const state = st?.state || 'STOPPED'
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600 }}>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600, flexShrink: 0, whiteSpace: 'nowrap' }}>
       <span className={`dot st-${state}`} />
       {st?.label || 'Unknown'}
     </span>
@@ -29,7 +68,7 @@ function Pipeline({ st }) {
       {STEPS.map(([k, label], idx) => {
         const done = rank > idx
         const cur = rank === idx
-        const bg = done ? '#22c55e' : cur ? (st.state === 'OK' ? '#22c55e' : '#eab308') : 'var(--border-strong)'
+        const bg = done ? 'var(--success)' : cur ? (st.state === 'OK' ? 'var(--success)' : 'var(--warning)') : 'var(--border-strong)'
         return (
           <div key={k} style={{ flex: 1, textAlign: 'center' }}>
             <div style={{ height: 5, borderRadius: 3, background: bg }} />
@@ -71,7 +110,7 @@ const PIN_RE = /^\d{4,8}$/  // basic client-side validity: 4–8 digits, numeric
 //  - LOCKED (PIN required, IMSI not yet readable): show basic info + a PIN field, no Provision.
 //    Entering a correct PIN unlocks IMSI+SMSC on the backend and the card refreshes.
 //  - READY (PIN disabled, or unlocked): show identity + SMSC, offer Provision.
-function UnprovisionedCard({ card, refresh, onProvision }) {
+function UnprovisionedCard({ card, refresh, onProvision, onCopy }) {
   const [pinInput, setPinInput] = useState('')
   const [pin, setPin] = useState('')          // remembered correct PIN, forwarded to provisioning
   const [busy, setBusy] = useState(false)
@@ -92,18 +131,18 @@ function UnprovisionedCard({ card, refresh, onProvision }) {
     setBusy(false)
   }
 
-  const row = (k, v, mono) => (<>
-    <span style={{ color: 'var(--text-mute)' }}>{k}</span>
-    <span className={mono ? 'mono' : ''} style={mono ? { fontSize: 11 } : undefined}>{v}</span>
-  </>)
+  const row = (k, v, mono, opts) => (
+    <Kv k={k} mono={mono} truncate={opts?.truncate !== false}
+      title={opts?.title ?? (typeof v === 'string' ? v : undefined)} onCopy={onCopy}>{v}</Kv>
+  )
 
   if (!unlocked) {
     // LOCKED
     return (
       <div onClick={(e) => e.stopPropagation()}>
-        <div style={{ marginTop: 14, fontSize: 13, display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '6px 12px', color: 'var(--text-soft)' }}>
+        <div className="kv-grid" style={{ marginTop: 14 }}>
           {row('ICCID', card.iccid || '—', true)}
-          {row('Status', <span style={{ color: '#eab308' }}>🔒 SIM locked — PIN required</span>)}
+          {row('Status', <span style={{ color: '#eab308' }}>🔒 SIM locked — PIN required</span>, false, { truncate: false })}
           {card.pin_tries != null && row('PIN tries', card.pin_tries)}
         </div>
         <div style={{ marginTop: 14 }}>
@@ -128,16 +167,17 @@ function UnprovisionedCard({ card, refresh, onProvision }) {
   const smscMissing = !card.smsc
   return (
     <div onClick={(e) => e.stopPropagation()}>
-      <div style={{ marginTop: 14, fontSize: 13, display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '6px 12px', color: 'var(--text-soft)' }}>
+      <div className="kv-grid" style={{ marginTop: 14 }}>
         {row('ICCID', card.iccid || '—', true)}
         {row('IMSI', card.imsi || '—', true)}
         {card.mcc && card.mnc && row('Carrier', `${card.mcc}-${card.mnc}`)}
         {row('SMSC', card.smsc
-          ? <span className="mono">{card.smsc} <span style={{ color: 'var(--text-mute)' }}>· from SIM</span></span>
-          : <span style={{ color: '#eab308' }}>⚠ could not read from SIM — enter manually when provisioning</span>)}
+          ? <span>{card.smsc} <span style={{ color: 'var(--text-mute)' }}>· from SIM</span></span>
+          : <span style={{ color: '#eab308' }}>⚠ could not read from SIM — enter manually when provisioning</span>,
+          !!card.smsc, { truncate: false, title: card.smsc || undefined })}
         {row('PIN', card.pin_enabled === false ? 'disabled' : 'unlocked ✓')}
       </div>
-      <button className="btn btn-primary" style={{ marginTop: 16 }}
+      <button className="btn btn-primary btn-sm" style={{ marginTop: 16, width: '100%' }}
         onClick={(e) => { e.stopPropagation(); onProvision(pin) }}>
         Provision this SIM{smscMissing ? ' (enter SMSC)' : ''}
       </button>
@@ -198,12 +238,19 @@ function StartPinModal({ inst, tries, error, onClose, onDone }) {
   )
 }
 
-export default function Dashboard({ instances, cards = [], noReaders, cardsKnown, refresh, setSelected, selected, setView, showToast }) {
+export default function Dashboard({ instances, cards = [], noReaders, cardsKnown, refresh, setSelected, setView, showToast }) {
   const [busy, setBusy] = useState(null)
   const [provision, setProvision] = useState(null)
   const [sipInfo, setSipInfo] = useState(null)
   const [pinPrompt, setPinPrompt] = useState(null)   // {inst, tries, error} when a start needs a PIN
 
+  const copyField = (label, text) => {
+    if (text == null) {
+      showToast?.(`Could not copy ${label}`, 'err')
+      return
+    }
+    showToast?.(`Copied ${label}`)
+  }
   // A start/reprovision may be refused (409) because the card needs a PIN we don't have
   // (deleted, or the saved one is now wrong). Surface that as a PIN prompt instead of an
   // opaque error; anything else is shown as an alert.
@@ -248,7 +295,7 @@ export default function Dashboard({ instances, cards = [], noReaders, cardsKnown
           </div>
         </div>
       )}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(360px,1fr))', gap: 16 }}>
+      <div className="cards-fill">
         {!noReaders && rows.length === 0 && (
           <div className="card" style={{ padding: 24, color: 'var(--text-dim)' }}>
             No card readers detected. Plug in a PC/SC reader and insert a SIM.
@@ -256,29 +303,24 @@ export default function Dashboard({ instances, cards = [], noReaders, cardsKnown
         )}
         {rows.map((r) => {
           const inst = r.instance
-          const isSel = inst && selected?.id === inst.id
           const d = inst?.status?.detail || {}
-          const clickable = !!inst
           return (
-            <div key={`rdr-${r.name || r.index}`} className="card"
-              onClick={() => clickable && setSelected(inst.id)}
-              style={{ padding: 20, cursor: clickable ? 'pointer' : 'default',
-                outline: isSel ? '2px solid var(--primary)' : '1px solid transparent', outlineOffset: 2 }}>
+            <div key={`rdr-${r.name || r.index}`} className="card" style={{ padding: 20 }}>
 
               {/* ---- Header: reader as the identity ---- */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: 10 }}>
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 15, fontWeight: 700 }}>{readerTitle(r)}</span>
-                    {isSel && <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--primary)', border: '1px solid var(--primary)', borderRadius: 6, padding: '1px 6px' }}>ACTIVE</span>}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: 10, minWidth: 0 }}>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div className="truncate" style={{ fontSize: 15, fontWeight: 700 }} title={readerTitle(r)}>
+                    {readerTitle(r)}
                   </div>
-                  <div style={{ fontSize: 12, color: 'var(--text-mute)', marginTop: 3 }}>
+                  <div className="truncate" style={{ fontSize: 12, color: 'var(--text-mute)', marginTop: 3 }}
+                    title={inst ? (inst.name || `Line ${inst.id}`) : undefined}>
                     {inst ? (inst.name || `Line ${inst.id}`) : r.present ? 'Unprovisioned SIM' : 'Empty'}
                   </div>
                 </div>
                 {inst
                   ? <StateBadge st={inst.status} />
-                  : <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600, color: r.present ? '#eab308' : 'var(--text-mute)' }}>
+                  : <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600, flexShrink: 0, whiteSpace: 'nowrap', color: r.present ? '#eab308' : 'var(--text-mute)' }}>
                       <span className={`dot st-${r.present ? 'REGISTERING' : 'NO_CARD'}`} />
                       {r.present ? 'SIM detected' : 'No SIM card'}
                     </span>}
@@ -299,39 +341,49 @@ export default function Dashboard({ instances, cards = [], noReaders, cardsKnown
                       {inst.status.retry && inst.status.retry.count > 0 && inst.status.state !== 'ERROR' &&
                         <span style={{ color: 'var(--text-mute)' }}> · attempt {inst.status.retry.count}/{inst.status.retry.max}</span>}
                       {inst.status.state === 'ERROR' && setView &&
-                        <span> · <a onClick={(e) => { e.stopPropagation(); setSelected(inst.id); setView('logs') }}
+                        <span> · <a onClick={() => { setSelected(inst.id); setView('logs') }}
                           style={{ cursor: 'pointer', textDecoration: 'underline' }}>view logs</a></span>}
                     </div>
                   )}
-                  <div style={{ marginTop: 16, fontSize: 13, display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '6px 12px', color: 'var(--text-soft)' }}>
-                    <span style={{ color: 'var(--text-mute)' }}>Carrier</span><span>{`${inst.mcc}-${inst.mnc}`}</span>
-                    <span style={{ color: 'var(--text-mute)' }}>Number</span><span className="mono">{d.msisdn || inst.msisdn || '—'}</span>
-                    <span style={{ color: 'var(--text-mute)' }}>IMSI</span><span className="mono" style={{ fontSize: 11 }}>{inst.imsi || '—'}</span>
-                    <span style={{ color: 'var(--text-mute)' }}>ICCID</span><span className="mono" style={{ fontSize: 11 }}>{r.card?.iccid || inst.iccid || '—'}</span>
-                    <span style={{ color: 'var(--text-mute)' }}>SMSC</span><span className="mono">{d.smsc || inst.smsc || '—'}</span>
-                    <span style={{ color: 'var(--text-mute)' }}>P-CSCF</span><span className="mono" style={{ fontSize: 11 }}>{d.pcscf || '—'}</span>
-                    <span style={{ color: 'var(--text-mute)' }}>IMS reg</span><span>{d.registration || '—'}</span>
-                    <span style={{ color: 'var(--text-mute)' }}>PIN</span><span>{d.pin?.state || '—'}{d.pin?.tries_left != null ? ` (${d.pin.tries_left} tries)` : ''}</span>
+                  <div className="kv-grid">
+                    <Kv k="Carrier" onCopy={copyField}>{`${inst.mcc}-${inst.mnc}`}</Kv>
+                    <Kv k="Number" mono onCopy={copyField} title={d.msisdn || inst.msisdn || undefined}>{d.msisdn || inst.msisdn || '—'}</Kv>
+                    <Kv k="IMSI" mono onCopy={copyField} title={inst.imsi || undefined}>{inst.imsi || '—'}</Kv>
+                    <Kv k="ICCID" mono onCopy={copyField} title={r.card?.iccid || inst.iccid || undefined}>{r.card?.iccid || inst.iccid || '—'}</Kv>
+                    <Kv k="SMSC" mono onCopy={copyField} title={d.smsc || inst.smsc || undefined}>{d.smsc || inst.smsc || '—'}</Kv>
+                    <Kv k="P-CSCF" mono onCopy={copyField} title={d.pcscf || undefined}>{d.pcscf || '—'}</Kv>
+                    <Kv k="IMS reg">{d.registration || '—'}</Kv>
+                    <Kv k="PIN">{d.pin?.state || '—'}{d.pin?.tries_left != null ? ` (${d.pin.tries_left} tries)` : ''}</Kv>
                   </div>
-                  <div style={{ display: 'flex', gap: 8, marginTop: 18, flexWrap: 'wrap' }} onClick={(e) => e.stopPropagation()}>
-                    {inst.status?.state === 'STOPPED'
-                      ? <button className="btn btn-primary" disabled={busy === inst.id} onClick={() => act(inst.id, () => api.start(inst.id))}>Start</button>
-                      : inst.status?.state === 'ERROR'
-                      ? <button className="btn btn-primary" disabled={busy === inst.id} onClick={() => act(inst.id, () => api.reprovision(inst.id))}>Re-provision</button>
-                      : <button className="btn btn-ghost" disabled={busy === inst.id} onClick={() => act(inst.id, () => api.stop(inst.id))}>Stop</button>}
-                    {inst.status?.state !== 'STOPPED' && inst.status?.state !== 'ERROR' &&
-                      <button className="btn btn-ghost" disabled={busy === inst.id} onClick={() => act(inst.id, () => api.register(inst.id))}>Re-register</button>}
-                    {inst.status?.state !== 'STOPPED' && inst.status?.state !== 'ERROR' &&
-                      <button className="btn btn-ghost" disabled={busy === inst.id} onClick={() => act(inst.id, () => api.reprovision(inst.id))}>Re-provision</button>}
-                    <button className="btn btn-ghost" onClick={() => setSipInfo(inst)}>SIP info</button>
-                    <button className="btn btn-ghost" onClick={() => { setSelected(inst.id); setView && setView('sims') }}>Configure ▸</button>
+                  <div className="card-actions">
+                    {inst.status?.state === 'STOPPED' ? (
+                      <button className="btn btn-primary btn-sm btn-span" disabled={busy === inst.id}
+                        onClick={() => act(inst.id, () => api.start(inst.id))}>Start</button>
+                    ) : inst.status?.state === 'ERROR' ? (
+                      <button className="btn btn-primary btn-sm btn-span" disabled={busy === inst.id}
+                        onClick={() => act(inst.id, () => api.reprovision(inst.id))}>Re-provision</button>
+                    ) : (
+                      <button className="btn btn-ghost btn-sm btn-span" disabled={busy === inst.id}
+                        onClick={() => act(inst.id, () => api.stop(inst.id))}>Stop</button>
+                    )}
+                    {inst.status?.state !== 'STOPPED' && inst.status?.state !== 'ERROR' && (
+                      <>
+                        <button className="btn btn-ghost btn-sm" disabled={busy === inst.id}
+                          onClick={() => act(inst.id, () => api.register(inst.id))}>Re-register</button>
+                        <button className="btn btn-ghost btn-sm" disabled={busy === inst.id}
+                          onClick={() => act(inst.id, () => api.reprovision(inst.id))}>Re-provision</button>
+                      </>
+                    )}
+                    <button className="btn btn-ghost btn-sm" onClick={() => setSipInfo(inst)}>SIP info</button>
+                    <button className="btn btn-ghost btn-sm"
+                      onClick={() => { setSelected(inst.id); setView && setView('sims') }}>Configure</button>
                   </div>
                 </>
               )}
 
               {/* ---- Unprovisioned card in this reader (PIN-gated flow) ---- */}
               {!inst && r.present && (
-                <UnprovisionedCard card={r.card} refresh={refresh}
+                <UnprovisionedCard card={r.card} refresh={refresh} onCopy={copyField}
                   onProvision={(pin) => setProvision({ card: r.card, pin })} />
               )}
 
