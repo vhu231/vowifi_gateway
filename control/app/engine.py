@@ -136,12 +136,32 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
         extra_hosts={"host.docker.internal": "host-gateway"},  # so notify.py can reach the manager
     )
     log.info("started engine container %s", c.name)
-    # render.py writes ENGINE_TOKEN into the bind-mounted run dir; also patch from the
-    # control plane so a race / older render still leaves a usable callback secret.
-    try:
-        cfg.sync_engine_token_to_run_dirs()
-    except Exception as e:  # noqa
-        log.debug("post-start engine token sync: %r", e)
+    # entrypoint render.py rewrites engine.env asynchronously after the container starts.
+    # A single immediate sync races that rewrite and leaves ENGINE_TOKEN missing (seen on
+    # Armbian: instance.json has the token, live engine.env does not). Retry briefly.
+    import threading
+    import time as _time
+
+    def _sync_token_retry():
+        env_path = os.path.join(DATA_DIR, "instances", iid, "run", "engine.env")
+        for attempt in range(30):
+            try:
+                cfg.sync_engine_token_to_run_dirs()
+                if os.path.isfile(env_path):
+                    with open(env_path, encoding="utf-8") as f:
+                        if any(line.startswith("ENGINE_TOKEN=") and line.strip() != "ENGINE_TOKEN="
+                               for line in f):
+                            if attempt:
+                                log.info("ENGINE_TOKEN synced into engine.env for %s (attempt %d)",
+                                         iid, attempt + 1)
+                            return
+            except Exception as e:  # noqa
+                log.debug("post-start engine token sync: %r", e)
+            _time.sleep(0.5)
+        log.warning("ENGINE_TOKEN still missing in %s after retries — inbound SMS may rely on "
+                    "events.jsonl ingest / container-IP fallback", env_path)
+
+    threading.Thread(target=_sync_token_retry, name=f"token-sync-{iid}", daemon=True).start()
     return c.id
 
 
@@ -284,6 +304,7 @@ def callback_health() -> dict:
         "engine_token_configured": bool(token),
         "notify_script_on_host": bool(notify_script_path()),
         "callback_path": "/api/engine/event",
+        "event_log_fallback": "instances/*/logs/events.jsonl (tailed by control; survives callback 401)",
         "events_via_callback": [
             "sms_in", "sms_out",
             "call_in", "call_out", "call_result",

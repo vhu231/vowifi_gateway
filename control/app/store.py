@@ -73,6 +73,16 @@ def add_message(instance: str, direction: str, peer: str, body: str, status: str
             "peer": peer, "body": body, "status": status, "error": None, "ts": ts}
 
 
+def has_message(instance: str, direction: str, peer: str, body: str) -> bool:
+    """True if an identical message row already exists (event_log / HTTP dedupe)."""
+    with _lock, _conn() as c:
+        row = c.execute(
+            "SELECT id FROM messages WHERE instance=? AND direction=? AND peer=? AND body=? LIMIT 1",
+            (str(instance), direction, peer, body),
+        ).fetchone()
+        return row is not None
+
+
 def list_threads(instance: str) -> list:
     with _lock, _conn() as c:
         rows = c.execute(

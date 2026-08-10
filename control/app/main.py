@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config as cfg
 from . import store, engine, status as status_mod, sim, card, notify_push, lpa, estkme, usbreader
 from . import auth as auth_mod
+from . import event_log
 from .ami import AmiClient
 
 logging.basicConfig(level=logging.INFO,
@@ -603,14 +604,24 @@ async def lifespan(app: FastAPI):
                      healed.get("token_files_updated"), healed.get("notify_pushed"))
     except Exception as e:  # noqa
         log.warning("engine.heal_callback_auth failed: %r", e)
+    # One-shot backfill from events.jsonl (recovers inbound SMS lost to callback 401s),
+    # then keep tailing so receive works even when /api/engine/event auth fails.
+    try:
+        n = await _ingest_event_logs(backfill=True)
+        if n:
+            log.info("event_log backfill processed %d engine event(s)", n)
+    except Exception as e:  # noqa
+        log.warning("event_log backfill failed: %r", e)
     poller = asyncio.create_task(status_poller())
     monitor = asyncio.create_task(card_monitor())
+    elog = asyncio.create_task(event_log_poller())
     yield
     poller.cancel()
     monitor.cancel()
+    elog.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
-    await asyncio.gather(poller, monitor, return_exceptions=True)
+    await asyncio.gather(poller, monitor, elog, return_exceptions=True)
     for c in hub.ami.values():
         await c.close()
     await hub.close_all_websockets(code=1001, reason="shutdown")
@@ -1763,27 +1774,8 @@ def _engine_event_authorized(request: Request, payload: dict) -> bool:
     )
 
 
-@app.post("/api/engine/event")
-async def api_engine_event(request: Request, payload: dict):
-    """Receives notify.py callbacks from engine containers."""
-    if not _engine_event_authorized(request, payload):
-        # Best-effort heal so the *next* notify succeeds (token file + notify.py header).
-        # Throttle: a flapping old engine must not docker-put on every rejected event.
-        now = time.time()
-        last = getattr(hub, "_last_callback_heal", 0.0)
-        if now - last >= 30.0:
-            hub._last_callback_heal = now
-            try:
-                engine.heal_callback_auth()
-            except Exception:  # noqa
-                pass
-        log.warning("engine event rejected (unauthorized): instance=%r event=%r peer=%s "
-                    "(inbound SMS/calls/push/cp_mode need ENGINE_TOKEN or matching engine IP; "
-                    "POST /api/system/engine-callbacks/heal)",
-                    (payload or {}).get("instance"), (payload or {}).get("event"),
-                    request.client.host if request.client else "?")
-        raise HTTPException(401, detail={"code": "engine_unauthorized",
-                                         "message": "Invalid engine callback credentials"})
+async def apply_engine_event(payload: dict, *, source: str = "http") -> dict:
+    """Apply one engine notify event (HTTP callback or events.jsonl ingest)."""
     iid = str(payload.get("instance", ""))
     event = payload.get("event", "")
     args = payload.get("args", [])
@@ -1807,9 +1799,14 @@ async def api_engine_event(request: Request, payload: dict):
             log.info("dropping empty-body inbound SMS from %r (internal signalling / binary/OTA "
                      "SIM message — no displayable text)", sender)
             return {"ok": True, "dropped": "empty_body"}
+        # HTTP + JSONL ingest can both see the same notify line — insert once.
+        if store.has_message(iid, "in", sender, text):
+            return {"ok": True, "deduped": True}
         rec = store.add_message(iid, "in", sender, text)
         await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
         _dispatch_push(notify_push.EV_INCOMING_SMS, iid, sender, text)
+        if source != "http":
+            log.info("inbound SMS via %s instance=%s from=%r", source, iid, sender)
     elif event == "sms_out" and len(args) >= 2:
         pass  # already stored by the send path
     elif event == "call_in":
@@ -1876,12 +1873,62 @@ async def api_engine_event(request: Request, payload: dict):
                 except Exception as e:  # noqa
                     log.warning("cp_mode_resolved persist failed for %s: %r", iid, e)
             await hub.broadcast({"type": "engine", "instance": iid, "event": event, "args": args})
+    elif event == "diag_ping":
+        return {"ok": True, "pong": True}
     else:
         await hub.broadcast({"type": "engine", "instance": iid, "event": event, "args": args})
     # real-time: any tunnel/registration transition triggers an immediate status push
     if event in ("tunnel_up", "tunnel_down", "pcscf", "registered", "unregistered"):
         asyncio.create_task(push_status(iid))
     return {"ok": True}
+
+
+async def _ingest_event_logs(*, backfill: bool) -> int:
+    """Drain new (or all, if backfill) events.jsonl lines into apply_engine_event."""
+    pending: list[dict] = []
+
+    def collect(ev: dict):
+        pending.append(ev)
+
+    n = await asyncio.to_thread(
+        lambda: event_log.poll_once(collect, backfill_missing=backfill))
+    for ev in pending:
+        await apply_engine_event(ev, source="event_log")
+    return n
+
+
+async def event_log_poller():
+    """Tail bind-mounted engine events.jsonl so inbound SMS survives callback 401s."""
+    while True:
+        try:
+            await _ingest_event_logs(backfill=False)
+        except Exception as e:  # noqa
+            log.debug("event_log_poller: %r", e)
+        await asyncio.sleep(1.5)
+
+
+@app.post("/api/engine/event")
+async def api_engine_event(request: Request, payload: dict):
+    """Receives notify.py callbacks from engine containers."""
+    if not _engine_event_authorized(request, payload):
+        # Best-effort heal so the *next* notify succeeds (token file + notify.py header).
+        # Throttle: a flapping old engine must not docker-put on every rejected event.
+        now = time.time()
+        last = getattr(hub, "_last_callback_heal", 0.0)
+        if now - last >= 30.0:
+            hub._last_callback_heal = now
+            try:
+                engine.heal_callback_auth()
+            except Exception:  # noqa
+                pass
+        log.warning("engine event rejected (unauthorized): instance=%r event=%r peer=%s "
+                    "(inbound SMS/calls/push/cp_mode need ENGINE_TOKEN or matching engine IP; "
+                    "events.jsonl ingest remains active; POST /api/system/engine-callbacks/heal)",
+                    (payload or {}).get("instance"), (payload or {}).get("event"),
+                    request.client.host if request.client else "?")
+        raise HTTPException(401, detail={"code": "engine_unauthorized",
+                                         "message": "Invalid engine callback credentials"})
+    return await apply_engine_event(payload or {}, source="http")
 
 
 async def push_status(iid: str):
