@@ -359,7 +359,10 @@ export default function App() {
             <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0 }}>{viewLabel}</h1>
           </header>
 
-          <main style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: '6px 24px calc(24px + var(--safe-bottom))' }}>
+          <main className="app-content" style={{
+            flex: 1, minHeight: 0, overflowX: 'hidden', overflowY: 'auto',
+            padding: '6px 24px calc(24px + var(--safe-bottom))',
+          }}>
             <ErrorBoundary key={view}>
               {View && (
                 <View

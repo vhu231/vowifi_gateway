@@ -263,6 +263,12 @@ body {
   font-family: inherit;
   box-shadow: 0 1px 2px color-mix(in srgb, var(--shadow) 45%, transparent);
   transition: transform var(--duration-fast) var(--ease), background var(--duration-fast) var(--ease), border-color var(--duration-fast) var(--ease), box-shadow var(--duration-fast) var(--ease);
+  /* Equal cells: prevent * / 0 / # from changing button size on narrow screens */
+  box-sizing: border-box;
+  aspect-ratio: 1;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
 }
 .dial-key:hover {
   background: var(--active) !important;
@@ -271,6 +277,50 @@ body {
   box-shadow: 0 4px 9px color-mix(in srgb, var(--shadow) 65%, transparent);
 }
 .dial-key:active { transform: scale(.97); }
+.dial-pad {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+  max-width: 280px;
+  margin: 0 auto;
+}
+.dtmf-pad {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+  max-width: 220px;
+  margin: 0 auto;
+  flex-shrink: 0;
+}
+.dtmf-pad .dial-key {
+  min-height: 48px;
+  max-height: 56px;
+  padding: 0 !important;
+  font-size: 18px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  cursor: pointer;
+  background: var(--hover);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.msg-bubble {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: pre-wrap;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.msg-row {
+  max-width: min(74%, 100%);
+  min-width: 0;
+  box-sizing: border-box;
+}
 .call-fab {
   appearance: none;
   box-shadow: 0 5px 12px color-mix(in srgb, var(--success) 28%, transparent);
@@ -523,8 +573,19 @@ a { color: inherit; }
 }
 @media (max-width: 860px) {
   .split-pane, .split-pane.softphone {
-    grid-template-columns: 1fr;
-    grid-template-rows: none;
+    grid-template-columns: minmax(0, 1fr);
+    /* Keep a single bounded row so opening a thread/keypad doesn't stretch the page */
+    grid-template-rows: minmax(0, 1fr);
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .split-pane > .pane-list,
+  .split-pane > .pane-detail {
+    min-width: 0;
+    min-height: 0;
+    max-height: 100%;
+    overflow: hidden;
   }
   .split-pane.is-detail .pane-list,
   .split-pane.is-list .pane-detail { display: none; }
@@ -735,8 +796,136 @@ a { color: inherit; }
 }
 .error-state { color: var(--danger); }
 
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 8px; }
+/* ---- Logs page: fill main, only the log pane scrolls (no nested page scroll) ---- */
+.logs-page {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  gap: 10px;
+}
+.logs-page-empty {
+  overflow: auto;
+}
+.logs-chrome {
+  flex-shrink: 0;
+  min-width: 0;
+}
+.logs-chrome > .card {
+  margin-bottom: 10px;
+}
+.logs-err {
+  color: var(--danger);
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.logs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.logs-tabs {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.logs-tabs .btn {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.logs-tab-short { display: none; }
+.logs-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+.logs-auto {
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-mute);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.logs-auto input {
+  width: auto;
+  margin: 0;
+}
+.logs-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-soft);
+  background: var(--input-bg);
+  max-width: 100%;
+  box-sizing: border-box;
+}
+@media (max-width: 860px) {
+  .logs-page { gap: 8px; }
+  .logs-chrome > .card {
+    margin-bottom: 8px;
+    padding: 8px 12px;
+  }
+  .logs-toolbar {
+    flex-wrap: nowrap;
+    gap: 6px;
+  }
+  .logs-tab-full { display: none; }
+  .logs-tab-short { display: inline; }
+  .logs-tabs .btn {
+    font-size: 12px;
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .logs-body { padding: 12px; font-size: 11.5px; }
+}
+
+/* Desktop only — custom width forces a permanent gutter on mobile WebKit */
+@media (hover: hover) and (pointer: fine) {
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 8px; }
+}
+
+/* Phones / touch: keep scroll, hide the always-on track (Dashboard main, panes, etc.) */
+@media (max-width: 860px), (hover: none), (pointer: coarse) {
+  .app-content,
+  .app-sidebar,
+  .pane-list,
+  .pane-detail,
+  .dialog-panel,
+  .login-shell,
+  .logs-body {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .app-content::-webkit-scrollbar,
+  .app-sidebar::-webkit-scrollbar,
+  .pane-list::-webkit-scrollbar,
+  .pane-detail::-webkit-scrollbar,
+  .dialog-panel::-webkit-scrollbar,
+  .login-shell::-webkit-scrollbar,
+  .logs-body::-webkit-scrollbar {
+    width: 0 !important;
+    height: 0 !important;
+    display: none;
+  }
+}
 
 @keyframes ringpulse {
   0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent); }

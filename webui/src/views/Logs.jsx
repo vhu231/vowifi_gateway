@@ -37,6 +37,11 @@ function ansi(text) {
   return out
 }
 
+const TABS = [
+  { id: 'engine', short: 'Engine', full: 'Asterisk / engine' },
+  { id: 'charon', short: 'IKE', full: 'SWu tunnel (IKE)' },
+]
+
 export default function Logs({ selected, instances, cards, setSelected }) {
   const id = selected?.id
   const [logs, setLogs] = useState({ engine: '', charon: '' })
@@ -59,37 +64,48 @@ export default function Logs({ selected, instances, cards, setSelected }) {
   const rendered = useMemo(() => ansi(logs[tab] || '(empty)'), [logs, tab])
 
   if (!id) return (
-    <div>
+    <div className="logs-page logs-page-empty">
       <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} label="Show logs for" />
       <div style={{ color: 'var(--text-dim)' }}>Select a SIM / line to view its engine and IKE logs.</div>
     </div>
   )
 
   return (
-    <div>
-      <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} label="Show logs for" />
-      {err && (
-        <div style={{ color: 'var(--danger)', marginBottom: 10, fontSize: 13 }} role="alert">
-          {err}{' '}
-          <button type="button" className="btn btn-ghost btn-sm" onClick={load}>Retry</button>
+    <div className="logs-page">
+      <div className="logs-chrome">
+        <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} label="Show logs for" />
+        {err && (
+          <div className="logs-err" role="alert">
+            {err}{' '}
+            <button type="button" className="btn btn-ghost btn-sm" onClick={load}>Retry</button>
+          </div>
+        )}
+        <div className="logs-toolbar">
+          <div className="logs-tabs" role="tablist" aria-label="Log source">
+            {TABS.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                role="tab"
+                aria-selected={tab === t.id}
+                className={`btn btn-sm ${tab === t.id ? 'btn-primary' : 'btn-ghost'}`}
+                onClick={() => setTab(t.id)}
+              >
+                <span className="logs-tab-full">{t.full}</span>
+                <span className="logs-tab-short">{t.short}</span>
+              </button>
+            ))}
+          </div>
+          <div className="logs-actions">
+            <button type="button" className="btn btn-ghost btn-sm" onClick={load}>Refresh</button>
+            <label className="logs-auto">
+              <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
+              auto
+            </label>
+          </div>
         </div>
-      )}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-        {['engine', 'charon'].map((t) => (
-          <button key={t} type="button" className={`btn ${tab === t ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab(t)}>
-            {t === 'engine' ? 'Asterisk / engine' : 'SWu tunnel (IKE)'}
-          </button>
-        ))}
-        <button type="button" className="btn btn-ghost" onClick={load}>Refresh</button>
-        <label style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
-          <input type="checkbox" style={{ width: 'auto' }} checked={auto} onChange={(e) => setAuto(e.target.checked)} /> auto
-        </label>
       </div>
-      <pre className="mono card" style={{
-        padding: 16, fontSize: 12, lineHeight: 1.5, overflow: 'auto',
-        height: 'min(70vh, calc(100dvh - 220px))', whiteSpace: 'pre-wrap', color: 'var(--text-soft)',
-        background: 'var(--input-bg)', maxWidth: '100%',
-      }}>
+      <pre className="logs-body mono card" tabIndex={0}>
         {rendered}
       </pre>
     </div>

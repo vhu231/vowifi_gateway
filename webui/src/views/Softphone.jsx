@@ -115,7 +115,7 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
   const endLabel = (c) => (c === 'Rejected' ? 'Call declined' : c === 'Busy' ? 'Busy' : c === 'Canceled' || c === 'Canceled/Rejected' ? 'Call cancelled' : 'Call ended')
 
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+    <div style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <div style={{ flexShrink: 0 }}>
         <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} />
       </div>
@@ -158,15 +158,21 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
           )}
 
           {call?.state === 'active' && (
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', textAlign: 'center', gap: 14 }}>
-              <Avatar color={GREEN} size={84} />
-              <div>
-                <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number || 'Unknown'}</div>
+            <div style={{
+              flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', flexDirection: 'column',
+              justifyContent: keypad ? 'flex-start' : 'center', textAlign: 'center', gap: 12, paddingBottom: 8,
+            }}>
+              {!keypad && <Avatar color={GREEN} size={84} />}
+              <div style={{ flexShrink: 0 }}>
+                <div className="mono" style={{
+                  fontSize: keypad ? 16 : 20, fontWeight: 700, overflow: 'hidden',
+                  textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%',
+                }}>{call.number || 'Unknown'}</div>
                 <div style={{ fontSize: 15, color: GREEN, marginTop: 4, fontVariantNumeric: 'tabular-nums' }}>{fmtDur(dur)}</div>
                 {recording && <div style={{ fontSize: 12, color: RED, marginTop: 2 }}>● Recording</div>}
               </div>
               {keypad && (
-                <div style={{ maxWidth: 220, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ width: '100%', maxWidth: 240, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 8, flexShrink: 0 }}>
                   <div className="mono" style={{
                     minHeight: 40, padding: '8px 12px', borderRadius: 8,
                     background: 'var(--surface-2)', border: '1px solid var(--border)',
@@ -175,20 +181,20 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
                   }}>
                     {dtmfSeq || 'Type or tap keys'}
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
+                  <div className="dtmf-pad">
                     {KEYS.map(([k]) => (
-                      <button key={k} type="button" className="btn btn-ghost" style={{ padding: 12, fontSize: 18 }}
+                      <button key={k} type="button" className="dial-key"
                         onClick={() => actions.pressDTMF(k)}>{k}</button>
                     ))}
                   </div>
                 </div>
               )}
-              <div style={{ display: 'flex', justifyContent: 'center', gap: 22, marginTop: 8 }}>
+              <div style={{ display: 'flex', justifyContent: 'center', gap: 22, marginTop: 4, flexShrink: 0 }}>
                 <RoundBtn icon={<Icon name={muted ? 'mute' : 'mic'} />} label={muted ? 'Unmute' : 'Mute'} color="#60a5fa" onClick={actions.toggleMute} active={muted} />
                 <RoundBtn icon={<Icon name="keypad" />} label="Keypad" color="#a78bfa" onClick={actions.toggleKeypad} active={keypad} />
                 <RoundBtn icon={<Icon name="record" />} label={recording ? 'Stop' : 'Record'} color={RED} onClick={actions.toggleRecord} active={recording} />
               </div>
-              <div style={{ display: 'flex', justifyContent: 'center', marginTop: 6 }}>
+              <div style={{ display: 'flex', justifyContent: 'center', marginTop: 2, flexShrink: 0 }}>
                 <RoundBtn icon={<Icon name="decline" />} label="Hang up" color="#fff" bg={RED} onClick={actions.hangup} />
               </div>
             </div>
@@ -216,14 +222,15 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
                   fontSize: 24, textAlign: 'center', margin: '10px 0 16px', letterSpacing: 1,
                   border: 'none', background: 'transparent', boxShadow: 'none', minHeight: 48,
                 }} />
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10 }}>
+              <div className="dial-pad">
                 {KEYS.map(([k, sub]) => (
                   <button key={k} type="button" className="dial-key" onClick={() => dialKey(k)} style={{
-                    padding: '10px 0', minHeight: 56, borderRadius: 12, cursor: 'pointer', background: 'var(--hover)',
-                    border: '1px solid var(--border)', color: 'var(--text)', display: 'flex', flexDirection: 'column', alignItems: 'center',
+                    padding: '8px 0', borderRadius: 12, cursor: 'pointer', background: 'var(--hover)',
+                    border: '1px solid var(--border)', color: 'var(--text)', display: 'flex', flexDirection: 'column',
+                    alignItems: 'center', justifyContent: 'center',
                   }}>
-                    <span style={{ fontSize: 22, fontWeight: 600 }}>{k}</span>
-                    <span style={{ fontSize: 9, color: 'var(--text-mute)', letterSpacing: 1, height: 10 }}>{sub}</span>
+                    <span style={{ fontSize: 22, fontWeight: 600, lineHeight: 1.1 }}>{k}</span>
+                    <span style={{ fontSize: 9, color: 'var(--text-mute)', letterSpacing: 1, height: 12, lineHeight: '12px' }}>{sub || '\u00a0'}</span>
                   </button>
                 ))}
               </div>
