@@ -192,9 +192,24 @@ export default function Settings({ auth, onAuthChange }) {
             padding: '10px 12px', borderRadius: 8, marginBottom: 10,
             background: 'var(--bg-elev, rgba(0,0,0,.2))', fontSize: 13,
           }}>
-            Managed by env <code>VOWIFI_ADVERTISE_ADDR</code> —
-            effective <span className="mono">{s.advertise_address_effective || '—'}</span>.
-            Clear the env var to edit the stored value here.
+            <div>
+              Managed by env <code>VOWIFI_ADVERTISE_ADDR</code> —
+              effective <span className="mono">{s.advertise_address_effective || '—'}</span>.
+              This page cannot override it while the env is set
+              (usually written into <code>vowifi-control.service</code> by <code>install.sh</code>).
+            </div>
+            <div style={{ marginTop: 8, color: 'var(--text-dim)' }}>
+              To change it yourself (local mode), from the repo directory run:
+            </div>
+            <pre className="mono" style={{
+              margin: '8px 0 0', padding: '8px 10px', borderRadius: 6, overflowX: 'auto',
+              background: 'rgba(0,0,0,.25)', fontSize: 12, whiteSpace: 'pre-wrap',
+            }}>{`sudo VOWIFI_ADVERTISE_ADDR=${s.advertise_address_detected || s.advertise_address_effective || '192.168.x.x'} ./install.sh reload`}</pre>
+            <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-mute)' }}>
+              That rewrites the systemd unit and restarts the control plane. Then Stop→Start
+              each running line so Asterisk reloads SDP. Use your LAN IP (detected:
+              {' '}<span className="mono">{s.advertise_address_detected || '—'}</span>), not a VPN/tunnel address.
+            </div>
           </div>
         ) : (
           <div>
@@ -209,6 +224,14 @@ export default function Settings({ auth, onAuthChange }) {
                 : 'auto (detect LAN IP)'}
               disabled={!!s.advertise_address_managed_by_env}
             />
+            <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-mute)' }}>
+              Tip: <code>./install.sh reload</code> may bake an auto-detected IP into systemd as
+              <code> VOWIFI_ADVERTISE_ADDR</code>. To pin via installer instead:
+              <pre className="mono" style={{
+                margin: '6px 0 0', padding: '8px 10px', borderRadius: 6, overflowX: 'auto',
+                background: 'rgba(0,0,0,.25)', fontSize: 12, whiteSpace: 'pre-wrap',
+              }}>{`sudo VOWIFI_ADVERTISE_ADDR=${s.advertise_address_detected || '192.168.x.x'} ./install.sh reload`}</pre>
+            </div>
           </div>
         )}
         <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-mute)' }} className="mono">
@@ -218,7 +241,8 @@ export default function Settings({ auth, onAuthChange }) {
             : ''}
         </div>
         <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-mute)' }}>
-          After saving, Stop→Start (or Re-provision) each running line so Asterisk reloads SDP.
+          After saving (or after the install.sh reload above), Stop→Start (or Re-provision)
+          each running line so Asterisk reloads SDP.
         </div>
       </div>
 

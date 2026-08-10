@@ -97,12 +97,31 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # Best-effort primary LAN IPv4 of THIS host (the address SIP/WebRTC clients must reach).
 detect_lan_ip() {
+  # Prefer a real LAN NIC over default-route src — a VPN/WireGuard default route otherwise
+  # yields the tunnel address (e.g. 10.14.0.2) which then gets baked into systemd as
+  # VOWIFI_ADVERTISE_ADDR and breaks local SIP RTP/DTMF.
   ip=""
   if have ip; then
-    ip=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
+    # eth*/en*/wlan* with a global IPv4, skip docker/VPN/tunnel ifaces
+    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '
+      $2 ~ /^(docker|br-|veth|virbr|cni|flannel|tun|tap|wg|ipsec|vti|uk-|nordlynx|ppp)/ { next }
+      $2 == "lo" { next }
+      {
+        split($4, a, "/")
+        addr = a[1]
+        if (addr ~ /^127\./ || addr ~ /^172\.17\./) next
+        print addr
+        exit
+      }')
+  fi
+  if [ -z "$ip" ] && have hostname; then
+    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^192\.168\.' | head -n1)
   fi
   if [ -z "$ip" ] && have hostname; then
     ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -v '^127\.' | head -n1)
+  fi
+  if [ -z "$ip" ] && have ip; then
+    ip=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
   fi
   printf '%s' "$ip"
 }
