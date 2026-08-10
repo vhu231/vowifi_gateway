@@ -46,6 +46,7 @@ class Hub:
         self._msisdn_tries: dict[str, int] = {}
         self.health: dict[str, dict] = {}    # per-instance retry/health tracking
         self._pushed_calls: set[int] = set() # call-record ids already push-notified (dedupe)
+        self._last_callback_heal: float = 0.0  # throttle heal_callback_auth on 401 storms
         # Per-reader serialization for PC/SC APDU access (sim.read_card / PIN / lpac).
         # lpac opens SCARD_SHARE_EXCLUSIVE; concurrent connect/APDU on the same reader
         # fails with sharing violations or corrupts eUICC sessions.
@@ -592,6 +593,16 @@ async def lifespan(app: FastAPI):
     # Persist session/engine secrets (and rotate credential_version if the env
     # password fingerprint changed) before serving any requests.
     cfg.ensure_auth_secrets()
+    # Repair engine→control callbacks for lines that stayed up across an auth upgrade:
+    # sync ENGINE_TOKEN into host-mounted engine.env and hot-patch notify.py so inbound
+    # SMS / Recent calls / webhook+Telegram / cp_mode_resolved work without Stop→Start.
+    try:
+        healed = await asyncio.to_thread(engine.heal_callback_auth)
+        if healed.get("token_files_updated") or healed.get("notify_pushed"):
+            log.info("engine callback heal: token_files=%s notify_pushed=%s",
+                     healed.get("token_files_updated"), healed.get("notify_pushed"))
+    except Exception as e:  # noqa
+        log.warning("engine.heal_callback_auth failed: %r", e)
     poller = asyncio.create_task(status_poller())
     monitor = asyncio.create_task(card_monitor())
     yield
@@ -1204,6 +1215,24 @@ async def api_provision(body: dict):
 
 
 # ----------------------------- settings -----------------------------
+@app.get("/api/system/engine-callbacks")
+def api_engine_callbacks_health():
+    """Authenticated diagnostic: which lines can deliver inbound SMS/calls after Web auth.
+
+    The only engine→control HTTP path is POST /api/engine/event. Outbound SMS/calls use
+    AMI and do not need the engine callback token. Use this after an auth upgrade if
+    Messages/Recent calls/webhook look empty while softphone dialing still works.
+    """
+    return engine.callback_health()
+
+
+@app.post("/api/system/engine-callbacks/heal")
+async def api_engine_callbacks_heal():
+    """Re-sync ENGINE_TOKEN into engine.env and hot-patch notify.py on running engines."""
+    healed = await asyncio.to_thread(engine.heal_callback_auth)
+    return {"ok": True, **healed, "health": engine.callback_health()}
+
+
 @app.get("/api/settings")
 def api_get_settings():
     return cfg.public_settings()
@@ -1236,6 +1265,9 @@ async def api_instances():
         live_port = _reader_port_for_instance(inst)
         if live_port:
             safe["reader_port"] = live_port
+        # Always expose id as a string so WebUI / WS comparisons stay consistent
+        # (YAML may load numeric ids as ints; notify/WS always send strings).
+        safe["id"] = str(inst["id"])
         out.append({**safe, "status": st})
     return {"instances": out}
 
@@ -1710,20 +1742,46 @@ def _call_disposition(dialstatus: str, cause: int, direction: str = "out") -> st
 
 
 def _engine_event_authorized(request: Request, payload: dict) -> bool:
-    """Admit engine callbacks only with a matching X-Vowifi-Engine-Token.
+    """Admit engine callbacks with a matching token, or (legacy) matching container IP.
 
-    Reload recreates engine containers, so every live engine has the token from
-    render.py — no legacy IP fallback.
+    Prefer `X-Vowifi-Engine-Token`. Engines started before the auth upgrade (or before
+    recreate) may still POST without the header — accept those only when the TCP peer
+    (or first X-Forwarded-For hop) equals that instance's live container IP, so inbound
+    SMS / call history keep working without opening /api/engine/event to the network.
     """
     expected = cfg.engine_callback_token()
     got = (request.headers.get(auth_mod.ENGINE_TOKEN_HEADER) or "").strip()
-    return bool(expected and got and cfg.hmac_compare(got, expected))
+    iid = str((payload or {}).get("instance", "") or "")
+    ips: list[str] = []
+    if iid and cfg.get_instance(iid) and engine.is_running(iid):
+        ips = engine.container_ips(iid)
+    return auth_mod.engine_callback_authorized(
+        expected, got,
+        peer_host=request.client.host if request.client else "",
+        x_forwarded_for=request.headers.get("x-forwarded-for") or "",
+        container_ips=ips,
+    )
 
 
 @app.post("/api/engine/event")
 async def api_engine_event(request: Request, payload: dict):
     """Receives notify.py callbacks from engine containers."""
     if not _engine_event_authorized(request, payload):
+        # Best-effort heal so the *next* notify succeeds (token file + notify.py header).
+        # Throttle: a flapping old engine must not docker-put on every rejected event.
+        now = time.time()
+        last = getattr(hub, "_last_callback_heal", 0.0)
+        if now - last >= 30.0:
+            hub._last_callback_heal = now
+            try:
+                engine.heal_callback_auth()
+            except Exception:  # noqa
+                pass
+        log.warning("engine event rejected (unauthorized): instance=%r event=%r peer=%s "
+                    "(inbound SMS/calls/push/cp_mode need ENGINE_TOKEN or matching engine IP; "
+                    "POST /api/system/engine-callbacks/heal)",
+                    (payload or {}).get("instance"), (payload or {}).get("event"),
+                    request.client.host if request.client else "?")
         raise HTTPException(401, detail={"code": "engine_unauthorized",
                                          "message": "Invalid engine callback credentials"})
     iid = str(payload.get("instance", ""))

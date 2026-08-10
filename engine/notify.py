@@ -56,10 +56,28 @@ def main():
         token = os.environ.get("ENGINE_TOKEN") or env.get("ENGINE_TOKEN", "")
         if token:
             headers["X-Vowifi-Engine-Token"] = token
-        requests.post(f"{manager_url.rstrip('/')}/api/engine/event",
-                      json=payload, headers=headers, timeout=3, verify=False)
-    except Exception:
-        pass
+        r = requests.post(f"{manager_url.rstrip('/')}/api/engine/event",
+                          json=payload, headers=headers, timeout=3, verify=False)
+        if r.status_code >= 400:
+            # Persist failures next to the event so empty Recent-calls / Messages can be
+            # diagnosed without reproducing (common after auth: missing ENGINE_TOKEN → 401).
+            try:
+                with open("/logs/events.jsonl", "a") as f:
+                    f.write(json.dumps({
+                        "instance": inst_id, "event": event, "args": args,
+                        "post_status": r.status_code, "post_body": (r.text or "")[:300],
+                    }) + "\n")
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            with open("/logs/events.jsonl", "a") as f:
+                f.write(json.dumps({
+                    "instance": inst_id, "event": event, "args": args,
+                    "post_error": str(e)[:300],
+                }) + "\n")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

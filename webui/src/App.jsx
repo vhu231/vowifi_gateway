@@ -107,7 +107,7 @@ export default function App() {
     try {
       const r = await api.instances()
       setInstances(r.instances)
-      setSelected((s) => s || (r.instances[0] && r.instances[0].id))
+      setSelected((s) => s != null && s !== '' ? String(s) : (r.instances[0] ? String(r.instances[0].id) : null))
       setApiError(null)
     } catch (e) {
       if (e?.code === 'auth_required' || e?.status === 401) return
@@ -133,7 +133,7 @@ export default function App() {
     const off = connectWs((msg) => {
       if (msg.type === 'status') {
         const { type: _t, instance, ...status } = msg
-        setInstances((list) => list.map((i) => (i.id === instance ? { ...i, status } : i)))
+        setInstances((list) => list.map((i) => (String(i.id) === String(instance) ? { ...i, status } : i)))
       }
       if (msg.type === 'cards') { setCards(msg.cards); setCardsKnown(true) }
       if (msg.type === 'engine' && ['card_removed', 'reader_lost', 'reader_added', 'reader_removed'].includes(msg.event)) {
@@ -218,7 +218,7 @@ export default function App() {
     )
   }
 
-  const sel = instances.find((i) => i.id === selected)
+  const sel = instances.find((i) => String(i.id) === String(selected))
   const View = VIEW_MAP[view]
   const viewLabel = NAV.find(([k]) => k === view)?.[1] || view
 

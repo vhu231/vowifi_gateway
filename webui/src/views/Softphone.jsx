@@ -49,7 +49,7 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
   const { prov, reg, call, dur, muted, keypad, dtmfSeq, recording, actions } = sp || {}
 
   const loadCalls = useCallback(() => {
-    if (!id) return
+    if (id == null || id === '') return
     api.calls(id).then((r) => { setCalls(r.calls || []); setLoadErr(null) })
       .catch((e) => setLoadErr(e.message))
   }, [id])
@@ -58,8 +58,15 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
   useEffect(() => { setCallSelMode(false); setCallSel(new Set()) }, [id])
   useEffect(() => { if (!calls.length) { setCallSelMode(false); setCallSel(new Set()) } }, [calls.length])
   useEffect(() => subscribe && subscribe((m) => {
-    if (m.type === 'call' && m.instance === id) loadCalls()
+    // Coerce ids: API/YAML may use numbers; WS/notify always send strings.
+    if (m.type === 'call' && String(m.instance) === String(id)) loadCalls()
   }), [subscribe, id, loadCalls])
+  // Softphone call UI ends before / independently of the engine notify path — refresh
+  // history when a local call settles so Recent calls updates even if a WS type-mismatch
+  // or a brief notify glitch delayed the broadcast.
+  useEffect(() => {
+    if (call?.state === 'ended') loadCalls()
+  }, [call?.state, loadCalls])
 
   const toast = (m) => (showToast ? showToast(m) : null)
   const toggleCallSel = (cid) => setCallSel((s) => { const n = new Set(s); n.has(cid) ? n.delete(cid) : n.add(cid); return n })
@@ -264,7 +271,10 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
               const color = s === 'answered' ? GREEN : (s === 'rejected' || s === 'busy' || s === 'failed') ? RED
                 : (s === 'no answer' || s === 'cancelled' || s === 'missed') ? 'var(--warning)' : 'var(--text-dim)'
               const dlabel = c.direction === 'in' ? '↙ Incoming' : '↗ Outgoing'
+              const peer = (c.peer || '').trim()
+              const peerLabel = peer || 'Private number'
               const checked = callSel.has(c.id)
+              const when = c.start_ts ? new Date(Number(c.start_ts) * 1000).toLocaleString() : ''
               return (
                 <div key={c.id} className="hover-row"
                   style={{
@@ -273,19 +283,19 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
                     background: checked ? 'var(--active)' : 'var(--input-bg)',
                   }}>
                   {callSelMode && (
-                    <input type="checkbox" checked={checked} aria-label={`Select call with ${c.peer}`}
+                    <input type="checkbox" checked={checked} aria-label={`Select call with ${peerLabel}`}
                       onChange={() => toggleCallSel(c.id)} style={{ width: 'auto', flexShrink: 0 }} />
                   )}
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div className="mono" style={{ fontWeight: 600 }}>{c.peer}</div>
-                    <div style={{ fontSize: 11, color: 'var(--text-mute)' }}>{dlabel} · {new Date(c.start_ts * 1000).toLocaleString()}</div>
+                    <div className="mono" style={{ fontWeight: 600, color: peer ? undefined : 'var(--text-mute)' }}>{peerLabel}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-mute)' }}>{dlabel}{when ? ` · ${when}` : ''}</div>
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <span style={{ color, fontWeight: 600, textTransform: 'capitalize' }}>{c.status || 'ringing'}</span>
                     {!callSelMode && <>
                       <button type="button" className="btn btn-ghost btn-sm"
-                        disabled={reg !== 'registered'}
-                        onClick={() => actions.callPeer(c.peer)}>Call</button>
+                        disabled={reg !== 'registered' || !peer}
+                        onClick={() => actions.callPeer(peer)}>Call</button>
                       <button type="button" className="row-del" title="Delete this call" aria-label="Delete this call"
                         onClick={(e) => deleteOneCall(c.id, e)}><Icon name="trash" size={16} /></button>
                     </>}

@@ -81,7 +81,7 @@ By default the control-plane WebUI / REST API / live WebSocket are **open** (no 
 1. Open **Settings → Web access** and set a password (or export `VOWIFI_WEB_PASSWORD` before starting the control plane).
 2. After a password is set, browsers must sign in. A successful login stores an **HttpOnly / SameSite=Strict / Secure (HTTPS)** cookie for **30 days**.
 3. Multiple devices can stay signed in independently. **Sign out** clears only that device's cookie. **Changing or clearing** the password (or changing `VOWIFI_WEB_PASSWORD` + restart) invalidates every cookie immediately and closes live WebSockets.
-4. Engine → control callbacks (`/api/engine/event`) do **not** use the Web cookie; they use a separate `X-Vowifi-Engine-Token` injected into each engine container on start/reprovision (`reload` recreates engines, so they always carry the token).
+4. Engine → control callbacks (`/api/engine/event`) do **not** use the Web cookie; they use a separate `X-Vowifi-Engine-Token` injected into each engine on start (`engine.env`). **Inbound SMS, Recent calls, webhook/Telegram, and CP auto-pin all depend on this path**; outbound SMS/calls use AMI and do not. On control startup the manager heals live engines (writes the token into `engine.env` and hot-patches `notify.py`). Diagnostic (authenticated): `GET /api/system/engine-callbacks`, repair: `POST /api/system/engine-callbacks/heal`. Legacy engines without the header are accepted only from that instance’s live container IP. If receive is still empty, check the engine’s `/logs/events.jsonl` for `post_status: 401`.
 5. If you put the WebUI behind a reverse proxy, forward `Host` / `Origin` / `X-Forwarded-Proto` (and ideally the real client IP) so CSRF checks and Secure cookies keep working.
 
 ---

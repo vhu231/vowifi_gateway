@@ -358,6 +358,50 @@ def engine_callback_token() -> str:
     return (get_auth().get("engine_token") or "").strip()
 
 
+def sync_engine_token_to_run_dirs() -> int:
+    """Write the current ENGINE_TOKEN into each instance's host-mounted engine.env.
+
+    notify.py re-reads /run/vowifi/engine.env on every callback, and that path is the
+    host bind-mount instances/<id>/run. After an auth upgrade the control plane may have
+    a token while a still-running engine's env file still lacks it — call/SMS events then
+    401 silently and Recent calls / Messages stay empty. Patching the env file restores
+    callbacks without forcing a container recreate.
+    """
+    token = engine_callback_token()
+    if not token:
+        return 0
+    root = os.path.join(DATA_DIR, "instances")
+    if not os.path.isdir(root):
+        return 0
+    updated = 0
+    for iid in os.listdir(root):
+        env_path = os.path.join(root, iid, "run", "engine.env")
+        if not os.path.isfile(env_path):
+            continue
+        try:
+            with open(env_path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            out: list[str] = []
+            found = False
+            for line in lines:
+                if line.startswith("ENGINE_TOKEN="):
+                    out.append(f"ENGINE_TOKEN={token}")
+                    found = True
+                else:
+                    out.append(line)
+            if not found:
+                out.append(f"ENGINE_TOKEN={token}")
+            new = "\n".join(out) + ("\n" if out else "")
+            old = "\n".join(lines) + ("\n" if lines else "")
+            if new != old:
+                with open(env_path, "w", encoding="utf-8") as f:
+                    f.write(new)
+                updated += 1
+        except OSError:
+            continue
+    return updated
+
+
 def list_instances() -> list:
     return list(load()["instances"].values())
 

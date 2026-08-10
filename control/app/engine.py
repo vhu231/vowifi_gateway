@@ -92,12 +92,26 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
         volumes[cert_host] = {"bind": "/etc/asterisk/certificate.crt", "mode": "ro"}
         volumes[key_host] = {"bind": "/etc/asterisk/certificate.key", "mode": "ro"}
 
+    eng = _engine_tree()
+    # Always overlay notify.py when the host tree has it. Inbound SMS / call history POST
+    # to /api/engine/event with X-Vowifi-Engine-Token; an older engine image without that
+    # header silently 401s after Web-auth upgrades. Binding the repo copy avoids requiring
+    # an immediate `docker build` of vowifi/engine just to restore receive path.
+    notify_src = notify_script_path()
+    if notify_src:
+        volumes[notify_src] = {"bind": "/usr/local/bin/notify.py", "mode": "ro"}
+
     if dev_mounts:
-        eng = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "engine")
         for f in ["pin_keeper.py", "ami_usim.py", "render.py", "notify.py", "swu_ike.py"]:
-            volumes[os.path.join(eng, f)] = {"bind": f"/usr/local/bin/{f}", "mode": "ro"}
-        volumes[os.path.join(eng, "entrypoint.sh")] = {"bind": "/entrypoint.sh", "mode": "ro"}
-        volumes[os.path.join(eng, "templates")] = {"bind": "/opt/vowifi/templates", "mode": "ro"}
+            src = os.path.join(eng, f)
+            if os.path.isfile(src):
+                volumes[src] = {"bind": f"/usr/local/bin/{f}", "mode": "ro"}
+        ep = os.path.join(eng, "entrypoint.sh")
+        if os.path.isfile(ep):
+            volumes[ep] = {"bind": "/entrypoint.sh", "mode": "ro"}
+        tpl = os.path.join(eng, "templates")
+        if os.path.isdir(tpl):
+            volumes[tpl] = {"bind": "/opt/vowifi/templates", "mode": "ro"}
 
     port_bindings = {
         f"{5060}/udp": ports.get("sip_udp", 5060),
@@ -122,6 +136,12 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
         extra_hosts={"host.docker.internal": "host-gateway"},  # so notify.py can reach the manager
     )
     log.info("started engine container %s", c.name)
+    # render.py writes ENGINE_TOKEN into the bind-mounted run dir; also patch from the
+    # control plane so a race / older render still leaves a usable callback secret.
+    try:
+        cfg.sync_engine_token_to_run_dirs()
+    except Exception as e:  # noqa
+        log.debug("post-start engine token sync: %r", e)
     return c.id
 
 
@@ -142,16 +162,145 @@ def is_running(iid: str) -> bool:
         return False
 
 
-def container_ip(iid: str) -> str | None:
+def container_ips(iid: str) -> list[str]:
+    """All IPv4/IPv6 addresses attached to the engine container (every docker network)."""
     try:
         c = _client().containers.get(container_name(iid))
-        nets = c.attrs["NetworkSettings"]["Networks"]
+        nets = ((c.attrs.get("NetworkSettings") or {}).get("Networks") or {})
+        ips: list[str] = []
         for n in nets.values():
-            if n.get("IPAddress"):
-                return n["IPAddress"]
+            for key in ("IPAddress", "GlobalIPv6Address"):
+                addr = (n.get(key) or "").strip()
+                if addr and addr not in ips:
+                    ips.append(addr)
+        return ips
     except Exception:
-        return None
-    return None
+        return []
+
+
+def container_ip(iid: str) -> str | None:
+    ips = container_ips(iid)
+    return ips[0] if ips else None
+
+
+def _engine_tree() -> str:
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "engine")
+
+
+def notify_script_path() -> str | None:
+    path = os.path.join(_engine_tree(), "notify.py")
+    return path if os.path.isfile(path) else None
+
+
+def push_notify_script_to_running() -> int:
+    """Hot-patch /usr/local/bin/notify.py inside every running engine container.
+
+    Auth upgrades require notify.py to send X-Vowifi-Engine-Token. Waiting for the
+    next Stop→Start leaves inbound SMS/calls broken; docker put_archive fixes live
+    containers without tearing down the IPsec/IMS session.
+    """
+    import io
+    import tarfile
+
+    src = notify_script_path()
+    if not src:
+        return 0
+    try:
+        data = open(src, "rb").read()
+    except OSError as e:
+        log.warning("cannot read notify.py for hot-patch: %r", e)
+        return 0
+    client = _client()
+    updated = 0
+    for inst in cfg.list_instances():
+        iid = str(inst["id"])
+        try:
+            c = client.containers.get(container_name(iid))
+            if c.status != "running":
+                continue
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as tar:
+                info = tarfile.TarInfo(name="notify.py")
+                info.size = len(data)
+                info.mode = 0o755
+                tar.addfile(info, io.BytesIO(data))
+            buf.seek(0)
+            if not c.put_archive("/usr/local/bin", buf):
+                log.warning("put_archive notify.py failed for engine %s", iid)
+                continue
+            updated += 1
+        except docker.errors.NotFound:
+            continue
+        except Exception as e:  # noqa
+            log.warning("hot-patch notify.py on engine %s failed: %r", iid, e)
+    return updated
+
+
+def heal_callback_auth() -> dict:
+    """Repair engine→control callback auth for already-running lines.
+
+    1) Write ENGINE_TOKEN into each host-mounted engine.env (notify re-reads per call).
+    2) Push the current notify.py into running containers (adds the token header).
+    """
+    token_files = 0
+    try:
+        token_files = cfg.sync_engine_token_to_run_dirs()
+    except Exception as e:  # noqa
+        log.warning("sync_engine_token_to_run_dirs failed: %r", e)
+    notify_pushed = 0
+    try:
+        notify_pushed = push_notify_script_to_running()
+    except Exception as e:  # noqa
+        log.warning("push_notify_script_to_running failed: %r", e)
+    return {"token_files_updated": token_files, "notify_pushed": notify_pushed}
+
+
+def callback_health() -> dict:
+    """Snapshot used by GET /api/system/engine-callbacks (authenticated)."""
+    token = cfg.engine_callback_token()
+    rows = []
+    for inst in cfg.list_instances():
+        iid = str(inst["id"])
+        env_path = os.path.join(DATA_DIR, "instances", iid, "run", "engine.env")
+        env_token = ""
+        if os.path.isfile(env_path):
+            try:
+                with open(env_path, encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("ENGINE_TOKEN="):
+                            env_token = line.split("=", 1)[1].strip()
+                            break
+            except OSError:
+                pass
+        running = is_running(iid)
+        rows.append({
+            "id": iid,
+            "running": running,
+            "container_ips": container_ips(iid) if running else [],
+            "engine_env_has_token": bool(env_token),
+            "engine_env_token_matches": bool(env_token and token and env_token == token),
+        })
+    return {
+        "engine_token_configured": bool(token),
+        "notify_script_on_host": bool(notify_script_path()),
+        "callback_path": "/api/engine/event",
+        "events_via_callback": [
+            "sms_in", "sms_out",
+            "call_in", "call_out", "call_result",
+            "tunnel_up", "tunnel_down", "pcscf",
+            "registered", "unregistered", "cp_mode_resolved",
+        ],
+        "apis_not_via_callback": [
+            "POST /api/instances/{id}/sms/send",
+            "POST /api/instances/{id}/call",
+            "POST /api/instances/{id}/hangup",
+            "POST /api/instances/{id}/register",
+            "GET  /api/instances/{id}/status (AMI + run files)",
+            "GET  /api/instances/{id}/logs",
+            "eSIM / PIN / provision / start / stop",
+        ],
+        "instances": rows,
+    }
 
 
 def read_run_json(iid: str, name: str) -> dict | None:

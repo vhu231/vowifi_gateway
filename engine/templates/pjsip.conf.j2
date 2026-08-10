@@ -65,6 +65,9 @@ dedicated_bearer_up=yes
 100rel=peer_supported
 moh_passthrough=yes
 direct_media=no
+; In-call digits (IVR): prefer RFC4733 telephone-event, else SIP INFO. Plain inband
+; DTMF is destroyed by AMR transcoding, so do not fall back to inband (dtmf_mode=auto).
+dtmf_mode=auto_info
 smsc_uri=sip:{{ smsc }}@{{ realm }}
 sdp_owner={{ sdp_owner }}
 sdp_session={{ sdp_session }}
@@ -169,6 +172,10 @@ rewrite_contact=yes
 ; left on (the default) Asterisk would try to re-INVITE the two ends to talk directly, which
 ; can't work → no audio. (volte_ims already has direct_media=no.)
 direct_media=no
+; In-call keypad digits. Browser softphone uses WebRTC insertDTMF (RFC4733). Many third-party
+; SIP clients send SIP INFO or RFC2833; default dtmf_mode=rfc4733 alone drops INFO, and
+; inband tones do not survive AMR on the IMS leg — symptom: softphone IVR works, SIP IVR fails.
+dtmf_mode=auto_info
 {% if msisdn %}
 callerid=undefined <{{ msisdn }}>
 {% endif %}

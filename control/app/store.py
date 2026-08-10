@@ -159,21 +159,6 @@ def get_open_call(instance: str, direction: str, within_s: int | None = None) ->
         return dict(row)
 
 
-def get_open_call(instance: str, direction: str, within_s: int | None = None) -> dict | None:
-    """The most recent still-open (not yet finalized, end_ts IS NULL) call for (instance,
-    direction), or None. `within_s` bounds how old the open record may be so a genuinely new
-    call after a stale unfinalized one still starts fresh."""
-    with _lock, _conn() as c:
-        row = c.execute(
-            "SELECT * FROM calls WHERE instance=? AND direction=? AND end_ts IS NULL "
-            "ORDER BY start_ts DESC LIMIT 1", (str(instance), direction)).fetchone()
-        if not row:
-            return None
-        if within_s is not None and int(time.time()) - row["start_ts"] > within_s:
-            return None
-        return dict(row)
-
-
 def add_call_deduped(instance: str, direction: str, peer: str, status: str = "ringing",
                      open_within_s: int = 90) -> dict:
     """Insert an inbound-call record, coalescing concurrent duplicate `call_in` events for the

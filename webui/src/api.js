@@ -134,6 +134,9 @@ export const api = {
 
   settings: () => j('GET', '/api/settings'),
   saveSettings: (patch) => j('PUT', '/api/settings', patch),
+  /** Auth-upgrade diagnostic: inbound SMS/calls need /api/engine/event + ENGINE_TOKEN. */
+  engineCallbacks: () => j('GET', '/api/system/engine-callbacks'),
+  healEngineCallbacks: () => j('POST', '/api/system/engine-callbacks/heal', {}),
 
   instances: () => j('GET', '/api/instances'),
   cards: () => j('GET', '/api/cards'),

@@ -7,9 +7,9 @@ export default function SimSelector({ instances = [], cards = [], selected, setS
     (String(c.matched) === String(i.id) || (c.iccid && c.iccid === i.iccid)))
   const live = instances.filter((i) => readerFor(i))
 
-  const id = selected?.id
+  const id = selected?.id != null ? String(selected.id) : ''
   useEffect(() => {
-    if (id && !live.some((i) => i.id === id)) setSelected(live[0]?.id || null)
+    if (id && !live.some((i) => String(i.id) === id)) setSelected(live[0] ? String(live[0].id) : null)
   }, [id, live.map((i) => i.id).join(',')])  // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!live.length) return null
@@ -24,7 +24,7 @@ export default function SimSelector({ instances = [], cards = [], selected, setS
           const c = readerFor(i)
           const rd = c ? `Reader ${c.index}` : null
           const st = i.status?.label ? ` — ${i.status.label}` : ''
-          return <option key={i.id} value={i.id}>{rd ? `${rd} · ` : ''}{i.name || i.imsi}{st}</option>
+          return <option key={String(i.id)} value={String(i.id)}>{rd ? `${rd} · ` : ''}{i.name || i.imsi}{st}</option>
         })}
       </select>
       {live.length === 1 && <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>only line</span>}

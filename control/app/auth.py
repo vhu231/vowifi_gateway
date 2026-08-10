@@ -24,6 +24,61 @@ COOKIE_MAX_AGE = 30 * 24 * 3600  # 30 days
 WS_CLOSE_AUTH = 4401
 ENGINE_TOKEN_HEADER = "X-Vowifi-Engine-Token"
 
+
+def engine_callback_authorized(
+    expected_token: str,
+    got_token: str,
+    *,
+    peer_host: str = "",
+    x_forwarded_for: str = "",
+    container_ip: str | None = None,
+    container_ips: list[str] | None = None,
+) -> bool:
+    """Admit an engine → control callback.
+
+    Token match wins. Otherwise (legacy containers without the header) accept only
+    when the TCP peer or first X-Forwarded-For hop equals one of that engine's
+    live container IPs.
+    """
+    expected = (expected_token or "").strip()
+    got = (got_token or "").strip()
+    if expected and got and hmac.compare_digest(got.encode("utf-8"), expected.encode("utf-8")):
+        return True
+    ips: list[str] = []
+    if container_ips:
+        ips.extend(str(ip).strip() for ip in container_ips if ip and str(ip).strip())
+    if container_ip and str(container_ip).strip():
+        cip = str(container_ip).strip()
+        if cip not in ips:
+            ips.append(cip)
+    if not ips:
+        return False
+    peer = (peer_host or "").strip()
+    if peer and peer in ips:
+        return True
+    xf = (x_forwarded_for or "").split(",")[0].strip()
+    return bool(xf and xf in ips)
+
+
+# ---------------------------------------------------------------------------
+# Auth-surface map (post Web-static-password). Keep in sync with main.py routes.
+#
+# Engine → control (ONLY HTTP callback; skipped by cookie middleware, uses
+# X-Vowifi-Engine-Token or legacy container-IP match):
+#   POST /api/engine/event
+#     sms_in          → store + WS + webhook/Telegram   (inbound SMS UI)
+#     call_in/out/result → call log + WS + push         (Recent calls)
+#     tunnel_*/pcscf/registered/unregistered → status push
+#     cp_mode_resolved → persist CP family
+#
+# Control → engine (AMI / Docker / files — NOT affected by engine callback token):
+#   SMS send, Originate/hangup, registration poll, logs, start/stop, eSIM/LPA, PIN
+#
+# Browser → control (cookie session when password set):
+#   All other /api/* + /ws. Softphone media/SIP is direct to the engine (WSS/SIP),
+#   not via these management APIs.
+# ---------------------------------------------------------------------------
+
 # scrypt params (OWASP-ish; tune for Pi-class hosts)
 _SCRYPT_N = 2 ** 14
 _SCRYPT_R = 8

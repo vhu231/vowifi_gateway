@@ -44,7 +44,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   useEffect(() => { setSelMode(false); setSelIds(new Set()) }, [peer])
   useEffect(() => { if (!msgs.length) { setSelMode(false); setSelIds(new Set()) } }, [msgs.length])
   useEffect(() => subscribe((msg) => {
-    if (msg.type === 'sms' && msg.instance === id) {
+    if (msg.type === 'sms' && String(msg.instance) === String(id)) {
       loadThreads()
       if (peer) loadMsgs(peer)
     }

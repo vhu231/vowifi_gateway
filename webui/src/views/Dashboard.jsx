@@ -92,7 +92,7 @@ function buildReaders(cards, instances) {
     .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
     .map((c) => {
       let inst = null
-      if (c.matched) inst = instances.find((i) => i.id === c.matched)
+      if (c.matched) inst = instances.find((i) => String(i.id) === String(c.matched))
       if (!inst && c.iccid) inst = instances.find((i) => i.iccid === c.iccid)
       return { index: c.index, name: c.name, present: !!c.present, card: c, instance: inst }
     })
@@ -265,7 +265,7 @@ export default function Dashboard({ instances, cards = [], noReaders, cardsKnown
     try { await fn(); await refresh() }
     catch (e) {
       const pe = pinError(e)
-      if (pe) setPinPrompt({ inst: instances.find((i) => i.id === id), tries: pe.tries,
+      if (pe) setPinPrompt({ inst: instances.find((i) => String(i.id) === String(id)), tries: pe.tries,
                              error: pe.code === 'pin_invalid' ? 'Saved PIN was wrong — enter it again.' : '' })
       else alert(e.message)
     }
