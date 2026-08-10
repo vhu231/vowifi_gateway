@@ -65,6 +65,24 @@ function previewPani(sip, mcc) {
   return parts.join(';')
 }
 
+function sipUsernameConflict(sip) {
+  const accounts = sip?.external || []
+  const webrtcUser = (sip?.webrtc?.username || 'webrtc').trim()
+  const seen = new Map()
+  for (let i = 0; i < accounts.length; i++) {
+    const name = String(accounts[i]?.username || '').trim()
+    if (!name) continue
+    if (name === webrtcUser) {
+      return `SIP username '${name}' is reserved for the built-in WebRTC softphone.`
+    }
+    if (seen.has(name)) {
+      return `SIP username '${name}' is used more than once (accounts #${seen.get(name) + 1} and #${i + 1}).`
+    }
+    seen.set(name, i)
+  }
+  return ''
+}
+
 export default function SimConfig({ instances, selected, refresh, cards, setSelected }) {
   const [readers, setReaders] = useState([])
   const [card, setCard] = useState(null)
@@ -146,6 +164,11 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   const save = async () => {
     setSaving(true)
     try {
+      const sipErr = sipUsernameConflict(form.sip)
+      if (sipErr) {
+        setPinMsg(sipErr)
+        throw new Error(sipErr)
+      }
       const body = { ...form, mnc: String(form.mnc).padStart(3, '0') }
       // Strip runtime-only fields that ride along on the instance object from /api/instances
       // (they are computed per-request, not config — never persist them).
@@ -160,7 +183,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       // A running line is restarted server-side to apply the new config (pjsip accounts,
       // IMEI, SMSC, User-Agent…); a stopped line just saves.
       setPinMsg(res?.applied ? 'Saved — restarting the line to apply changes…' : 'Saved.')
-    } catch (e) { alert(e.message) }
+    } catch (e) { setPinMsg(e.message); alert(e.message) }
     setSaving(false)
   }
 
@@ -184,6 +207,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
 
   const addAccount = () => updSip({ external: [...(form.sip.external || []), { username: '', password: '' }] })
   const setAccount = (i, k, v) => updSip({ external: form.sip.external.map((a, idx) => idx === i ? { ...a, [k]: v } : a) })
+  const sipUserErr = sipUsernameConflict(form.sip)
 
   return (
     <div style={{ maxWidth: 1000 }}>
@@ -371,12 +395,20 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
 
         <div style={{ marginTop: 12 }}>
           <label>External SIP accounts</label>
+          <div style={{ fontSize: 12, color: 'var(--text-mute)', marginBottom: 6 }}>
+            Each account needs a unique username (also cannot reuse the WebRTC softphone name).
+          </div>
           {(form.sip.external || []).map((a, i) => (
             <div key={i} className="row-2">
               <input placeholder="username" value={a.username} onChange={(e) => setAccount(i, 'username', e.target.value)} />
               <input placeholder="password" value={a.password} onChange={(e) => setAccount(i, 'password', e.target.value)} />
             </div>
           ))}
+          {sipUserErr && (
+            <div style={{ color: 'var(--danger)', fontSize: 12.5, marginTop: 6 }} role="alert">
+              {sipUserErr}
+            </div>
+          )}
           <button className="btn btn-ghost" onClick={addAccount}>+ Add account</button>
         </div>
 

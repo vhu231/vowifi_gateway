@@ -1132,6 +1132,11 @@ async def api_provision(body: dict):
         raise HTTPException(400, "could not read IMSI (is the PIN correct?)")
     sip = body.get("sip") or {"listen_addr": "0.0.0.0", "transport": "udp", "external": []}
     sip.setdefault("webrtc", {"enable": bool(body.get("webrtc", True))})
+    try:
+        cfg.validate_sip_external_usernames(sip)
+    except ValueError as e:
+        raise HTTPException(400, detail={"code": "duplicate_sip_username",
+                                         "message": str(e)}) from e
     # SMSC: manual override wins; otherwise read from the SIM (EF_SMSP, authoritative).
     # If the SIM can't provide it we ask the user to type it (no carrier presets).
     smsc = (body.get("smsc") or "").strip() or c.smsc
@@ -1252,8 +1257,19 @@ async def api_instance_upsert(body: dict):
     if "id" not in body:
         raise HTTPException(400, "id required")
     iid = str(body["id"])
+    # Fail fast on SIP username clashes before touching docker / restart scheduling.
+    if "sip" in body:
+        try:
+            cfg.validate_sip_external_usernames(body.get("sip"))
+        except ValueError as e:
+            raise HTTPException(400, detail={"code": "duplicate_sip_username",
+                                             "message": str(e)}) from e
     was_running = await asyncio.to_thread(engine.is_running, iid)
-    inst = cfg.upsert_instance(body)
+    try:
+        inst = cfg.upsert_instance(body)
+    except ValueError as e:
+        raise HTTPException(400, detail={"code": "duplicate_sip_username",
+                                         "message": str(e)}) from e
     applied = False
     # A running line holds its config in the engine container (rendered instance.json:
     # pjsip accounts, IMEI, SMSC, User-Agent, …). Editing the config alone doesn't reach

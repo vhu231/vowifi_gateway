@@ -484,6 +484,50 @@ def next_index(data: dict) -> int:
     return i
 
 
+# Asterisk pjsip section names already used by the engine templates. External SIP
+# usernames become endpoint/auth/aor section names and must not collide with these
+# (or with each other) or pjsip.conf is invalid.
+_SIP_RESERVED_USERNAMES = frozenset({
+    "global", "system", "volte_ims",
+    "endpoint-local", "auth-local", "aor-local",
+    "transport-local", "transport-wss",
+})
+
+
+def validate_sip_external_usernames(sip: dict | None) -> None:
+    """Raise ValueError if external SIP usernames are duplicated or reserved.
+
+    Empty usernames are ignored (placeholder rows). Comparison is case-sensitive to
+    match Asterisk section names; the WebRTC softphone username is also reserved.
+    """
+    sip = sip or {}
+    external = sip.get("external") or []
+    webrtc_user = str(((sip.get("webrtc") or {}).get("username") or "webrtc")).strip()
+    reserved = set(_SIP_RESERVED_USERNAMES)
+    if webrtc_user:
+        reserved.add(webrtc_user)
+
+    seen: dict[str, int] = {}
+    for i, acct in enumerate(external):
+        if not isinstance(acct, dict):
+            continue
+        name = str(acct.get("username") or "").strip()
+        if not name:
+            continue
+        if name in reserved:
+            raise ValueError(
+                f"SIP username '{name}' is reserved (used by the built-in softphone "
+                f"or Asterisk internals). Choose a different name."
+            )
+        prev = seen.get(name)
+        if prev is not None:
+            raise ValueError(
+                f"SIP username '{name}' is used more than once on this line "
+                f"(accounts #{prev + 1} and #{i + 1}). Each account needs a unique username."
+            )
+        seen[name] = i
+
+
 def upsert_instance(inst: dict) -> dict:
     data = load()
     iid = str(inst["id"])
@@ -523,6 +567,8 @@ def upsert_instance(inst: dict) -> dict:
     if not wr.get("password"):
         prev = (existing.get("sip", {}) or {}).get("webrtc", {}) or {}
         wr["password"] = prev.get("password") or secrets.token_urlsafe(12)
+    # Reject before persist: duplicate/reserved names would render a broken pjsip.conf.
+    validate_sip_external_usernames(sip)
     data["instances"][iid] = merged
     save(data)
     return merged
