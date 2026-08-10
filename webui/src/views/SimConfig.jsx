@@ -192,9 +192,15 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       }
       const res = await api.saveInstance(body)
       await refresh()
-      // A running line is restarted server-side to apply the new config (pjsip accounts,
-      // IMEI, SMSC, User-Agent…); a stopped line just saves.
-      setPinMsg(res?.applied ? 'Saved — restarting the line to apply changes…' : 'Saved.')
+      // Save only writes config.yaml. A running engine keeps its old rendered config until
+      // the user Stop+Start (or Re-provision) — tell them so SIP/IMEI edits aren't assumed live.
+      if (res?.restart_required) {
+        const msg = 'Saved. Restart this line (Stop → Start) for SIP / IMEI / softphone changes to take effect.'
+        setPinMsg(msg)
+        alert(msg)
+      } else {
+        setPinMsg('Saved.')
+      }
     } catch (e) { setPinMsg(e.message); alert(e.message) }
     setSaving(false)
   }
