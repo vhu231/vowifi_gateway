@@ -115,22 +115,28 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
   const endLabel = (c) => (c === 'Rejected' ? 'Call declined' : c === 'Busy' ? 'Busy' : c === 'Canceled' || c === 'Canceled/Rejected' ? 'Call cancelled' : 'Call ended')
 
   return (
-    <div style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    <div className="softphone-page" style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <div style={{ flexShrink: 0 }}>
         <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} />
       </div>
 
-      <div className="mobile-softphone-tabs" style={{ display: 'none', gap: 8, marginBottom: 12 }}>
+      <div className="mobile-softphone-tabs" style={{ display: 'none', alignItems: 'center', gap: 8, marginBottom: 12, flexShrink: 0 }}>
         <button type="button" className={`btn btn-sm ${mobilePane === 'phone' ? 'btn-primary' : 'btn-ghost'}`}
           onClick={() => setMobilePane('phone')}>Phone</button>
         <button type="button" className={`btn btn-sm ${mobilePane === 'history' ? 'btn-primary' : 'btn-ghost'}`}
           onClick={() => setMobilePane('history')}>Recent</button>
+        <div style={{
+          marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: regColor, minWidth: 0,
+        }} title={reg}>
+          <span style={{ width: 7, height: 7, borderRadius: 999, background: regColor, flexShrink: 0 }} aria-hidden />
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{reg}</span>
+        </div>
       </div>
 
       <div className={`split-pane softphone ${mobilePane === 'history' ? 'is-detail' : 'is-list'}`}
         data-mobile-pane={mobilePane}>
-        <div className="card pane-list" style={{ padding: 24, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <div className="card pane-list" style={{ padding: 24, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <div className="softphone-meta" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, flexShrink: 0 }}>
             <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>Softphone</div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: regColor }}>
               <span style={{ width: 8, height: 8, borderRadius: 999, background: regColor }} aria-hidden />
@@ -215,10 +221,10 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
           )}
 
           {!inCall && (
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+            <div className="softphone-idle" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
               <input value={num} onChange={(e) => setNum(e.target.value)} placeholder="Enter a number"
                 aria-label="Phone number"
-                className="mono" style={{
+                className="mono softphone-num" style={{
                   fontSize: 24, textAlign: 'center', margin: '10px 0 16px', letterSpacing: 1,
                   border: 'none', background: 'transparent', boxShadow: 'none', minHeight: 48,
                 }} />
@@ -234,7 +240,7 @@ export default function Softphone({ selected, subscribe, instances, cards, setSe
                   </button>
                 ))}
               </div>
-              <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 24, marginTop: 16 }}>
+              <div className="softphone-actions" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 24, marginTop: 16, flexShrink: 0 }}>
                 <div style={{ width: 58 }} />
                 <button type="button" className="call-fab" onClick={() => { actions.placeCall(num); setNum('') }}
                   disabled={reg !== 'registered' || !num} aria-label="Place call"

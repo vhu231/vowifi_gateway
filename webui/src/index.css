@@ -309,6 +309,37 @@ body {
   border: 1px solid var(--border);
   color: var(--text);
 }
+
+/* Shared SIM / line picker — compact on phones */
+.sim-selector {
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+.sim-selector-label {
+  font-size: 12px;
+  color: var(--text-mute);
+  white-space: nowrap;
+  margin: 0;
+  flex-shrink: 0;
+}
+.sim-label-short { display: none; }
+.sim-selector-select {
+  flex: 1 1 auto;
+  min-width: 0 !important;
+  max-width: none !important;
+  width: auto !important;
+}
+.sim-selector-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
 .msg-bubble {
   overflow-wrap: anywhere;
   word-break: break-word;
@@ -812,8 +843,8 @@ a { color: inherit; }
   flex-shrink: 0;
   min-width: 0;
 }
-.logs-chrome > .card {
-  margin-bottom: 10px;
+.logs-chrome > .sim-selector {
+  margin-bottom: 8px;
 }
 .logs-err {
   color: var(--danger);
@@ -877,10 +908,32 @@ a { color: inherit; }
   box-sizing: border-box;
 }
 @media (max-width: 860px) {
+  .app-content {
+    padding-left: 12px !important;
+    padding-right: 12px !important;
+    padding-top: 4px !important;
+    padding-bottom: calc(10px + var(--safe-bottom)) !important;
+  }
+
+  .sim-selector {
+    padding: 5px 8px;
+    margin-bottom: 6px;
+    gap: 6px;
+  }
+  .sim-label-full { display: none; }
+  .sim-label-short { display: inline; }
+  .sim-selector-label { font-size: 11px; }
+  .sim-selector select {
+    min-height: 34px;
+    padding: 4px 8px;
+    font-size: 13px;
+    border-radius: 8px;
+  }
+  .sim-selector-hint { display: none; }
+
   .logs-page { gap: 8px; }
-  .logs-chrome > .card {
-    margin-bottom: 8px;
-    padding: 8px 12px;
+  .logs-chrome > .sim-selector {
+    margin-bottom: 6px;
   }
   .logs-toolbar {
     flex-wrap: nowrap;
@@ -894,6 +947,62 @@ a { color: inherit; }
     padding-right: 8px;
   }
   .logs-body { padding: 12px; font-size: 11.5px; }
+
+  /* Softphone: fit dial pad + actions without page scroll on typical phones */
+  .softphone-page .mobile-softphone-tabs {
+    margin-bottom: 6px !important;
+    gap: 6px !important;
+  }
+  .softphone-page .pane-list {
+    padding: 10px 12px !important;
+  }
+  .softphone-page .pane-detail {
+    padding: 12px !important;
+  }
+  .softphone-meta { display: none !important; }
+  .softphone-idle {
+    min-height: 0;
+    overflow: hidden;
+    justify-content: flex-start;
+    gap: 0;
+  }
+  .softphone-idle .softphone-num {
+    font-size: 20px !important;
+    min-height: 36px !important;
+    margin: 4px 0 8px !important;
+  }
+  .softphone-idle .dial-pad {
+    max-width: min(220px, 68vw);
+    gap: 6px;
+    flex: 0 1 auto;
+  }
+  .softphone-idle .dial-key {
+    border-radius: 10px;
+  }
+  .softphone-idle .dial-key > span:first-child {
+    font-size: 18px !important;
+  }
+  .softphone-idle .softphone-actions {
+    margin-top: 10px !important;
+    gap: 16px !important;
+  }
+  .softphone-idle .call-fab {
+    width: 56px !important;
+    height: 56px !important;
+  }
+  .softphone-idle .icon-action {
+    width: 48px !important;
+    height: 48px !important;
+  }
+  .dtmf-pad {
+    max-width: 200px;
+    gap: 6px;
+  }
+  .dtmf-pad .dial-key {
+    min-height: 42px;
+    max-height: 48px;
+    font-size: 16px;
+  }
 }
 
 /* Desktop only — custom width forces a permanent gutter on mobile WebKit */
