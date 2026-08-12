@@ -233,7 +233,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
     <div style={{ maxWidth: 1000 }}>
       {instances.length > 1 &&
         <SimSelector instances={instances} cards={cards} selected={selected} setSelected={setSelected} label="Configuring line" />}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+      <div className="sim-config-grid">
       {/* Card / PIN panel */}
       <div className="card" style={{ padding: 20 }}>
         <h3 style={{ marginTop: 0 }}>SIM card</h3>
@@ -279,7 +279,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       {/* Instance form */}
       <div className="card" style={{ padding: 20 }}>
         <h3 style={{ marginTop: 0 }}>Line configuration</h3>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
           <Field label="Instance ID"><input value={form.id} onChange={(e) => upd({ id: e.target.value })} placeholder="1" /></Field>
           <Field label="Name"><input value={form.name} onChange={(e) => upd({ name: e.target.value })} placeholder="Telus" /></Field>
           <Field label="IMSI"><input className="mono" value={form.imsi} onChange={(e) => upd({ imsi: e.target.value })} /></Field>
@@ -344,7 +344,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         </div>
 
         <h4 style={{ marginBottom: 6 }}>Local SIP access</h4>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
           <Field label="Listen address">
             <select value={form.sip.listen_addr} onChange={(e) => updSip({ listen_addr: e.target.value })}>
               <option value="0.0.0.0">0.0.0.0 (all)</option>
