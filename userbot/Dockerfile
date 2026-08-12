@@ -18,6 +18,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# PJSIP 2.14.1's SWIG setup.py still does `from distutils.core import setup`.
+# Python 3.12 removed distutils; setuptools<81 puts it back.
+RUN pip install --no-cache-dir 'setuptools<81'
+
 # PJSIP with the Python bindings. --disable-sound is deliberate: the container
 # has no audio hardware and must not look for any; all audio moves through the
 # bridge port in sip_leg.py. Opus stays enabled so a wideband local leg is
