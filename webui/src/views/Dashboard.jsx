@@ -224,7 +224,10 @@ export default function Dashboard({ instances, cards = [], noReaders, cardsKnown
 
   const act = async (id, fn) => {
     setBusy(id)
-    try { await fn(); await refresh() }
+    // Kick the refresh off but don't wait for it: /api/instances re-derives every line's
+    // status (Docker + AMI) and can take seconds, while the state this action produced is
+    // pushed over the WebSocket anyway. Awaiting it left the whole page looking frozen.
+    try { await fn(); refresh().catch(() => {}) }
     catch (e) {
       const pe = pinError(e)
       if (pe) setPinPrompt({ inst: instances.find((i) => String(i.id) === String(id)), tries: pe.tries,
