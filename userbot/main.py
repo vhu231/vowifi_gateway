@@ -199,21 +199,30 @@ class UserBot:
         text = event.raw_text.strip()
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@", 1)[0].lower(), arg.strip()
+        if cmd not in ("/start", "/help", "/call", "/dtmf", "/hangup"):
+            return
+        try:
+            reply = await self._run_command(cmd, arg)
+        except Exception as e:  # noqa
+            # Telethon would swallow this into the container log, leaving the
+            # owner staring at a command that answered nothing at all.
+            log.exception("%s failed", cmd)
+            reply = f"{cmd} failed: {type(e).__name__}: {e}"
+        await event.reply(reply)
 
+    async def _run_command(self, cmd: str, arg: str) -> str:
         if cmd in ("/start", "/help"):
-            await event.reply(HELP)
-        elif cmd == "/call":
+            return HELP
+        if cmd == "/call":
             number = arg.split()[0] if arg else ""
             if not number:
-                await event.reply("Usage: /call <number>")
-            elif not self._may_dial(number):
-                await event.reply(f"{number} is not in this userbot's dial allow-list.")
-            else:
-                await event.reply(await self.bridge.place_call(number))
-        elif cmd == "/dtmf":
-            await event.reply(self.bridge.send_dtmf(arg))
-        elif cmd == "/hangup":
-            await event.reply(await self.bridge.hangup())
+                return "Usage: /call <number>"
+            if not self._may_dial(number):
+                return f"{number} is not in this userbot's dial allow-list."
+            return await self.bridge.place_call(number)
+        if cmd == "/dtmf":
+            return self.bridge.send_dtmf(arg)
+        return await self.bridge.hangup()
 
 
 if __name__ == "__main__":

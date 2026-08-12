@@ -60,7 +60,12 @@ class CallBridge:
             return "A call is already in progress."
         self._pending_outbound = number
         log.info("outbound: ringing the owner before dialling %s", number)
-        if not await self.tg.place_call():
+        try:
+            ringing = await self.tg.place_call()
+        except Exception:
+            self._pending_outbound = None
+            raise
+        if not ringing:
             self._pending_outbound = None
             return "Could not ring you on Telegram."
         return f"Calling you now — answer, and I'll dial {number}."

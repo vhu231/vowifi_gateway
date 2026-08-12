@@ -53,6 +53,7 @@ from telethon.tl.types import (
     PhoneCallDiscarded,
     PhoneCallProtocol,
     PhoneCallRequested,
+    PhoneCallWaiting,
     UpdatePhoneCall,
     UpdatePhoneCallSignalingData,
 )
@@ -261,9 +262,8 @@ class TelegramCallLeg:
         g_a_hash up front and only reveal g_a once they accept.
 
         Unlike the answering path below, this direction has no published working
-        reference — if a placed call connects silently, this is the first place
-        to instrument (specifically what init_exchange returns without a peer
-        hash, and whether ConfirmCall needs the raw g_a).
+        reference — if a placed call connects silently, the DH exchange is the
+        first place to instrument.
         """
         if self.active:
             log.warning("a call is already in progress")
@@ -273,19 +273,29 @@ class TelegramCallLeg:
         except Exception as e:  # noqa
             log.error("cannot resolve owner %s: %s", self.owner_id, e)
             return False
+        try:
+            return await self._place_call(peer)
+        except Exception:
+            # A half-built call leaves an ntgcalls session behind, and
+            # create_p2p_call refuses a second one for the same peer — so a
+            # retry would fail for a different reason than the first attempt.
+            await self._drop_session()
+            raise
 
+    async def _place_call(self, peer) -> bool:
         self._ntg_id = await self._ntg_call(self._ntg.create_p2p_call, self.owner_id) \
             or self.owner_id
         await self._ntg_call(self._ntg.set_stream_sources, self._ntg_id,
                              ntgcalls.StreamMode.CAPTURE, _audio_source())
 
         dh = await self.client(GetDhConfigRequest(version=0, random_length=256))
-        params = await self._ntg_call(
-            self._ntg.init_exchange, user_id=self._ntg_id,
-            dh_config=ntgcalls.DhConfig(g=dh.g, p=dh.p, random=dh.random))
-        g_a_hash = getattr(params, "g_a_hash", None) or getattr(params, "g_b", None)
-        if g_a_hash is None:
-            g_a_hash = bytes(params)
+        # init_exchange(user_id, dh_config, g_a_hash) — the third argument is
+        # required, not optional. None means "I am the caller", and what comes
+        # back is our own g_a_hash; passing the peer's hash is the answering
+        # side (_accept), which gets g_b back instead.
+        g_a_hash = await self._ntg_call(
+            self._ntg.init_exchange, self._ntg_id,
+            ntgcalls.DhConfig(g=dh.g, p=dh.p, random=dh.random), None)
 
         proto = ntgcalls.NTgCalls.get_protocol()
         res = await self.client(RequestCallRequest(
@@ -319,14 +329,12 @@ class TelegramCallLeg:
                              ntgcalls.StreamMode.CAPTURE, _audio_source())
 
         dh = await self.client(GetDhConfigRequest(version=0, random_length=256))
-        params = await self._ntg_call(
-            self._ntg.init_exchange, user_id=self._ntg_id,
-            dh_config=ntgcalls.DhConfig(g=dh.g, p=dh.p, random=dh.random),
-            g_a_hash=req.g_a_hash)
-        g_b = getattr(params, "g_b", None) or bytes(params)
+        g_b = await self._ntg_call(
+            self._ntg.init_exchange, self._ntg_id,
+            ntgcalls.DhConfig(g=dh.g, p=dh.p, random=dh.random), req.g_a_hash)
 
         proto = ntgcalls.NTgCalls.get_protocol()
-        await self.client(AcceptCallRequest(
+        res = await self.client(AcceptCallRequest(
             peer=InputPhoneCall(req.id, req.access_hash), g_b=g_b,
             protocol=PhoneCallProtocol(
                 min_layer=proto.min_layer, max_layer=proto.max_layer,
@@ -334,37 +342,58 @@ class TelegramCallLeg:
                 library_versions=list(proto.library_versions)),
         ))
         log.info("accepted call %s, waiting for confirmation", req.id)
+        # Normally still phoneCallWaiting here — the caller has yet to confirm —
+        # but take the live call if it is already there rather than assume.
+        await self._go_live_if_active(res)
 
     async def _confirm_outgoing(self, call: PhoneCallAccepted):
         """Caller side: they answered and sent g_b, so reveal g_a and confirm."""
+        # exchange_keys hands back AuthParams(g_a_or_b, key_fingerprint); on this
+        # side g_a_or_b is our g_a, and the fingerprint is computed from the
+        # shared key, so both go straight into ConfirmCall.
         params = await self._ntg_call(
-            self._ntg.exchange_keys, user_id=self._ntg_id,
-            g_a_or_b=call.g_b, fingerprint=0)
-        g_a = getattr(params, "g_a_or_b", None) or getattr(params, "g_a", None)
+            self._ntg.exchange_keys, self._ntg_id, call.g_b, 0)
         proto = ntgcalls.NTgCalls.get_protocol()
-        await self.client(ConfirmCallRequest(
+        res = await self.client(ConfirmCallRequest(
             peer=InputPhoneCall(call.id, call.access_hash),
-            g_a=g_a if isinstance(g_a, (bytes, bytearray)) else bytes(g_a or b""),
-            key_fingerprint=getattr(params, "key_fingerprint", 0),
+            g_a=bytes(params.g_a_or_b),
+            key_fingerprint=params.key_fingerprint,
             protocol=PhoneCallProtocol(
                 min_layer=proto.min_layer, max_layer=proto.max_layer,
                 udp_p2p=proto.udp_p2p, udp_reflector=proto.udp_reflector,
                 library_versions=list(proto.library_versions)),
         ))
+        log.info("confirmed call %s", call.id)
+        # confirmCall's own result carries the live call (endpoints, fingerprint).
+        # Waiting for an updatePhoneCall instead can mean waiting forever: the
+        # callee has already answered, so no media means Telegram drops the call
+        # as "disconnected" some twenty seconds later.
+        await self._go_live_if_active(res)
+
+    async def _go_live_if_active(self, result):
+        """Open media from an accept/confirm reply, if it already carries the
+        live call. Anything else means the handshake is still in flight and the
+        updatePhoneCall we also listen for is the one that will bring it."""
+        call = getattr(result, "phone_call", None)
+        if isinstance(call, PhoneCall):
+            await self._go_live(call)
+        else:
+            log.info("call handshake still pending (%s)", type(call).__name__)
 
     async def _go_live(self, call: PhoneCall):
         """Both sides agreed: finish the handshake and open the media path."""
         if self._connected:
             return          # Telegram repeats this update; a second connect_p2p raises
         self._connected = True
+        log.info("call %s agreed; opening media", call.id)
         try:
             # The answering side still owes exchange_keys; the caller already did it
             # in _confirm_outgoing, and repeating it is harmless enough to skip.
             if getattr(call, "g_a_or_b", None) is not None:
                 try:
                     await self._ntg_call(
-                        self._ntg.exchange_keys, user_id=self._ntg_id,
-                        g_a_or_b=call.g_a_or_b, fingerprint=call.key_fingerprint)
+                        self._ntg.exchange_keys, self._ntg_id,
+                        call.g_a_or_b, call.key_fingerprint)
                 except Exception as e:  # noqa
                     log.debug("exchange_keys already done: %s", e)
 
@@ -372,9 +401,8 @@ class TelegramCallLeg:
             if not servers:
                 raise RuntimeError("Telegram offered no connection endpoints")
             proto = ntgcalls.NTgCalls.get_protocol()
-            await self._ntg_call(self._ntg.connect_p2p, user_id=self._ntg_id,
-                                 servers=servers, versions=list(proto.library_versions),
-                                 p2p_allowed=True, deadline=12.0)
+            await self._ntg_call(self._ntg.connect_p2p, self._ntg_id, servers,
+                                 list(proto.library_versions), True, deadline=12.0)
 
             self._signaling_ready = True
             for queued in self._queued_signaling:
@@ -415,7 +443,9 @@ class TelegramCallLeg:
         await self._discard()
         await self._cleanup()
 
-    async def _cleanup(self):
+    async def _drop_session(self):
+        """Forget the call without telling the bridge — for an attempt that never
+        became a call, where tearing down the other leg would be wrong."""
         if self._sender:
             self._sender.stop()
             self._sender = None
@@ -427,6 +457,9 @@ class TelegramCallLeg:
         self._call_id = self._access_hash = self._ntg_id = None
         self._connected = self._signaling_ready = False
         self._queued_signaling.clear()
+
+    async def _cleanup(self):
+        await self._drop_session()
         if self.on_ended:
             await _maybe_await(self.on_ended())
 
@@ -439,14 +472,23 @@ class TelegramCallLeg:
         try:
             if isinstance(call, PhoneCallRequested):
                 await self._accept(call)
+            elif isinstance(call, PhoneCallWaiting):
+                # receive_date is the one field that says whether the callee's
+                # device was actually reached: unset means it is ringing nowhere.
+                log.info("call %s waiting — peer device %s", call.id,
+                         "is ringing" if call.receive_date else "not reached yet")
             elif isinstance(call, PhoneCallAccepted):
+                log.info("call %s accepted by the peer; confirming", call.id)
                 await self._confirm_outgoing(call)
             elif isinstance(call, PhoneCall):
                 await self._go_live(call)
             elif isinstance(call, PhoneCallDiscarded):
                 if self._call_id == call.id:
-                    log.info("call %s ended (%s)", call.id, call.reason)
+                    log.info("call %s ended (%s) after %ss", call.id, call.reason,
+                             getattr(call, "duration", 0) or 0)
                     await self._cleanup()
+            else:
+                log.info("call update ignored: %s", type(call).__name__)
         except Exception as e:  # noqa
             log.exception("call update handling failed: %s", e)
 
@@ -457,6 +499,7 @@ class TelegramCallLeg:
         if not self._signaling_ready:
             # Telegram starts relaying before connect_p2p exists to receive it.
             self._queued_signaling.append(data)
+            log.info("peer is signalling (%s packet(s) queued)", len(self._queued_signaling))
             return
         try:
             await self._ntg_call(self._ntg.send_signaling, self._ntg_id, data)
