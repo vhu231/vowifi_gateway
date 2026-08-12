@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
 from . import store, engine, status as status_mod, sim, card, notify_push, lpa, estkme, usbreader
+from . import telegram_bot
 from .ami import AmiClient
 
 logging.basicConfig(level=logging.INFO,
@@ -32,12 +33,18 @@ log = logging.getLogger("vowifi.main")
 WEBUI_DIR = os.environ.get("VOWIFI_WEBUI", os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "webui", "dist"))
 
+# How long a line whose AMI refused a connect is skipped before trying again. Long enough that
+# a down engine costs one attempt rather than one per caller, short enough that a line coming
+# back up shows as registered within a couple of poll cycles.
+AMI_RETRY_COOLDOWN = 15.0
+
 
 class Hub:
     """Holds AMI clients per instance and broadcasts events to WebSocket clients."""
     def __init__(self):
         self.ami: dict[str, AmiClient] = {}
         self._ami_locks: dict[str, asyncio.Lock] = {}  # per-instance ami_for serialisation
+        self._ami_retry_at: dict[str, float] = {}      # instance -> monotonic cooldown expiry
         self.clients: set[WebSocket] = set()
         self.cards: dict[str, dict] = {}     # reader NAME -> detected card/reader info
         self.scanned = False                 # card_monitor completed its first scan
@@ -51,6 +58,15 @@ class Hub:
         self.reader_locks: dict[str, asyncio.Lock] = {}
         self.lpa_busy: dict[str, bool] = {}  # readers currently owned by an LPA op
         self.lpa_downloads: dict[str, dict] = {}  # reader_name -> active download handle
+        # In-process subscribers to the same event stream the WebSocket carries. Lets a module
+        # inside the manager (the Telegram bot) follow SMS delivery, status and engine events
+        # without opening a WebSocket back to its own process.
+        self.listeners: set = set()
+
+    def subscribe(self, fn):
+        """Register an async callback for every broadcast. Returns an unsubscribe function."""
+        self.listeners.add(fn)
+        return lambda: self.listeners.discard(fn)
 
     def cards_list(self) -> list[dict]:
         """Reader/card entries sorted by current PC/SC index (the UI display order)."""
@@ -84,6 +100,9 @@ class Hub:
         'failed to authenticate' every few seconds. close() sets the client's closed flag which
         neutralises the pending reconnect."""
         c = self.ami.pop(str(iid), None)
+        # A deliberate stop/start is exactly when the operator expects a fresh attempt, so
+        # don't make them wait out a cooldown left over from the previous container.
+        self._ami_retry_at.pop(str(iid), None)
         if c:
             await c.close()
 
@@ -96,6 +115,13 @@ class Hub:
                 dead.append(ws)
         for ws in dead:
             self.clients.discard(ws)
+        # A misbehaving in-process listener must never break the event path for the WebSocket
+        # clients or for the engine-event handler that called us.
+        for fn in list(self.listeners):
+            try:
+                await fn(msg)
+            except Exception as e:  # noqa
+                log.debug("broadcast listener failed: %r", e)
 
     async def ami_for(self, iid: str) -> AmiClient | None:
         iid = str(iid)
@@ -105,10 +131,26 @@ class Hub:
         # failures once a container reuses its docker IP).
         lock = self._ami_locks.setdefault(iid, asyncio.Lock())
         async with lock:
-            inst = cfg.get_instance(iid)
-            running = bool(inst) and engine.is_running(iid)
-            ip = engine.container_ip(iid) if running else None
             client = self.ami.get(iid)
+            # A line whose Asterisk isn't accepting AMI yet (just started, or stopped) refuses
+            # every connect. Retrying on each caller made a single /api/instances pay the
+            # connect timeout once per line, so a known-bad line is skipped for a while. The
+            # status machine copes with ami_client=None; it just can't report registration.
+            if client is None and time.monotonic() < self._ami_retry_at.get(iid, 0.0):
+                return None
+            inst = cfg.get_instance(iid)
+
+            def _probe():
+                """Both Docker round trips in one hop, off the event loop."""
+                if not (inst and engine.is_running(iid)):
+                    return False, None
+                return True, engine.container_ip(iid)
+
+            try:
+                running, ip = await asyncio.to_thread(_probe)
+            except Exception as e:  # noqa  (daemon unreachable — don't take the API down)
+                log.debug("engine probe failed instance=%s: %r", iid, e)
+                running, ip = False, None
             # Reuse only a healthy client still pointed at the current container.
             if client and running and ip and client.connected and client.host == ip:
                 return client
@@ -123,11 +165,20 @@ class Hub:
                                inst["ami_secret"], realm=cfg.ims_realm(inst["mcc"], inst["mnc"]),
                                msisdn=inst.get("msisdn", ""), smsc=inst.get("smsc", ""))
             await client.connect()
+            if not client.connected:
+                # Caching a client that never logged in would keep panoramisk's reconnect
+                # timer alive AND hide this line from the cooldown check above, so the next
+                # caller would pay the connect timeout all over again.
+                await client.close()
+                self._ami_retry_at[iid] = time.monotonic() + AMI_RETRY_COOLDOWN
+                return None
+            self._ami_retry_at.pop(iid, None)
             self.ami[iid] = client
             return client
 
 
 hub = Hub()
+telegram = telegram_bot.TelegramBot(hub)
 
 
 def _match_instance_by_iccid(iccid):
@@ -468,7 +519,11 @@ def apply_health(iid, inst, st):
             now = time.monotonic()
             last = h.get("last_recover_try")
             due = last is None or (now - last) >= rint
-            if due and status_mod.resolve_epdg(_epdg_fqdn(inst)):
+            if due:
+                # The ePDG DNS probe that gates this used to run here, but apply_health is
+                # synchronous and called from the poller and from /api/instances — a slow
+                # resolver (exactly what an epdg_unresolved freeze implies) stalled the whole
+                # event loop. _auto_recover now makes that check off-thread and bails early.
                 h["last_recover_try"] = now
                 h["recovering"] = True
                 asyncio.create_task(_auto_recover(str(iid)))
@@ -527,6 +582,11 @@ async def _auto_recover(iid: str):
             return
         if h.get("frozen_code") not in NETWORK_RECOVERABLE:
             return
+        # The gate that used to live in apply_health: only a line whose ePDG resolves again is
+        # worth re-provisioning. Off-thread because getaddrinfo blocks, and this path exists
+        # precisely for lines whose DNS is currently unhappy.
+        if not await asyncio.to_thread(status_mod.resolve_epdg, _epdg_fqdn(inst)):
+            return
 
         inst = await _rebind_reader(iid, inst, ctx="auto-recover instance")
 
@@ -576,12 +636,16 @@ async def lifespan(app: FastAPI):
     store.init()
     poller = asyncio.create_task(status_poller())
     monitor = asyncio.create_task(card_monitor())
+    # Always started: the loop idles cheaply while the feature is off, which is what lets
+    # settings changes take effect without restarting the manager.
+    tgbot = asyncio.create_task(telegram.run())
     yield
     poller.cancel()
     monitor.cancel()
+    tgbot.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
-    await asyncio.gather(poller, monitor, return_exceptions=True)
+    await asyncio.gather(poller, monitor, tgbot, return_exceptions=True)
     for c in hub.ami.values():
         await c.close()
 
@@ -1382,6 +1446,14 @@ async def api_instance_stop(iid: str):
     # Tear down the AMI client too — otherwise its Manager keeps auto-reconnecting to the
     # now-removed container (and floods a container that later reuses the docker IP).
     await hub.drop_ami(iid)
+    # A deliberate stop must also clear any freeze. apply_health keeps overlaying ERROR while
+    # frozen_code is set, and a network-class freeze additionally schedules _auto_recover — so
+    # without this the poller quietly starts the line the user just stopped.
+    hub.reset_health(iid)
+    # Announce it. Every other state-changing route pushes; stop got away without one because
+    # the WebUI refetches after its own button press, which stops being true the moment
+    # something else (the Telegram bot) issues the stop.
+    asyncio.create_task(push_status(str(iid)))
     return {"ok": True}
 
 
@@ -1825,8 +1897,16 @@ def _dispatch_push(event: str, iid: str, source: str, text: str | None = None):
     tg = settings.get("telegram") or {}
     if not (wh.get("enabled") or tg.get("enabled")):
         return
-    asyncio.create_task(
-        asyncio.to_thread(notify_push.dispatch, settings, event, inst, source, text))
+
+    async def _fire():
+        message_id = await asyncio.to_thread(
+            notify_push.dispatch, settings, event, inst, source, text)
+        # Remember which conversation this notification announced, so a plain reply to it in
+        # the chat is answered as an SMS to that peer instead of needing /use + /sms.
+        if message_id and event == notify_push.EV_INCOMING_SMS:
+            telegram.remember_reply_target(message_id, str(iid), source)
+
+    asyncio.create_task(_fire())
 
 
 
