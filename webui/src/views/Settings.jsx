@@ -96,8 +96,8 @@ export default function Settings({ instances = [] }) {
   const ubBox = ubInfo.container || {}
   const ubRunning = ubBox.state === 'running'
   const ubLogin = ubInfo.login || {}
-  const ubNeedLogin = ubLogin.pending || ubLogin.need_password || !ubInfo.signed_in
-    || (ubRunning && !(ubInfo.status || {}).running)
+  const ubNeedLogin = !ubInfo.signed_in || ubLogin.pending || ubLogin.need_password
+    || !!ubLogin.phone
   const updUb = (patch) => setUb((x) => {
     const next = { ...x, ...patch }
     ubRef.current = next

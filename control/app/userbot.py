@@ -262,7 +262,7 @@ def snapshot() -> dict:
         "image_present": image_present(),
         "build": build_status(),
         "login": {
-            "pending": bool(login.get("phone_code_hash")) and not signed,
+            "pending": bool(login.get("phone_code_hash")),
             "need_password": bool(login.get("need_password")),
             "phone": login.get("phone") or "",
         },
