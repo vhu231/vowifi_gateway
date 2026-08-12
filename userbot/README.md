@@ -226,4 +226,3 @@ Not covered:
 | Long calls, concurrent calls, quality beyond "we could hold a conversation" | not measured |
 | More than two cards | never tried |
 | A second authorised account actually driving it | the code paths run, but one person did all the testing |
-| Teardown noise | an `asyncio` `Future exception was never retrieved` carrying `ntgcalls.ConnectionNotFound` is logged once per call. Both legs still end correctly and the next call places fine, but it is an ERROR-level traceback that means nothing, and it will mislead somebody |

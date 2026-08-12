@@ -69,6 +69,34 @@ FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE
 SILENCE = bytes(FRAME_BYTES)
 
 
+def _quiet_frames_for_dead_calls(loop: asyncio.AbstractEventLoop):
+    """Stop asyncio complaining about the last frame of every call.
+
+    Rule 3 above means the sender is still pushing frames at the instant a call
+    ends, and ntgcalls answers each send with an asyncio Future nobody waits on.
+    Once the peer hangs up it destroys the connection, so those last futures
+    complete with ConnectionNotFound and asyncio logs an ERROR traceback for
+    each — a race that cannot be avoided and means nothing. Retrieving them
+    instead would cost a cross-thread callback per frame, a hundred a second.
+
+    Only this exact combination is dropped; anything else still surfaces.
+    """
+    inherited = loop.get_exception_handler()
+
+    def handler(active_loop, context):
+        exc = context.get("exception")
+        if (isinstance(exc, ntgcalls.ConnectionNotFound)
+                and "never retrieved" in (context.get("message") or "")):
+            log.debug("frame landed after the call ended: %s", exc)
+            return
+        if inherited is not None:
+            inherited(active_loop, context)
+        else:
+            active_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+
+
 def _resolve(future, deadline: float = 5.0):
     """ntgcalls methods may hand back a Future. Wait it out on a worker thread —
     it needs the event loop free to make progress, so never do this inline."""
@@ -210,6 +238,7 @@ class TelegramCallLeg:
 
     def install(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
+        _quiet_frames_for_dead_calls(loop)
         self._register_callbacks()
         self.client.add_event_handler(self._on_update, events.Raw(UpdatePhoneCall))
         self.client.add_event_handler(self._on_signaling,
