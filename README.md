@@ -226,23 +226,25 @@ Send `/help` in the chat for the live list.
 
 ---
 
-## Telegram calls (userbot) — UNTESTED
+## Telegram calls (userbot)
 
 A bot account cannot join a Telegram voice call. Bridging Telegram calls to a SIM therefore needs a **second Telegram user account** and a separate container (`vowifi/userbot`).
 
-Configure it in **Settings → Telegram calls (userbot)**: API id / hash (from [my.telegram.org/apps](https://my.telegram.org/apps)), the spare account's phone number (`+…`), and your numeric Telegram user id (from [@userinfobot](https://t.me/userinfobot)). Pick the SIM line. Press **Start**. That one action:
+Configure it in **Settings → Telegram calls (userbot)**: API id / hash (from [my.telegram.org/apps](https://my.telegram.org/apps)), the spare account's phone number (`+…`), and your numeric Telegram user id (from [@userinfobot](https://t.me/userinfobot)). Add a **card** per SIM it should answer for, then press **Start**. That one action:
 
 1. Writes `data/userbot/config.json`
-2. Creates the external SIP account (`tgbridge` by default) on the chosen line if it is missing, and reloads PJSIP on a running engine
+2. Creates each card's external SIP account on its line if it is missing, and reloads PJSIP on a running engine
 3. Builds `vowifi/userbot` if the image is not present (first build compiles PJSIP; the page shows the log)
 4. Sends the Telegram login code to the spare account; type it (and the 2FA cloud password if asked) in the same card
 5. Starts the sidecar
 
 After that, Restart applies config changes. The control plane needs `telethon` in its venv (`sudo ./install.sh reload` on an existing install).
 
-**Telegram calls (userbot / ntgcalls / the SIP bridge) have not been tested on real hardware.** Treat this as a first draft to debug, not as something that works.
+**Several SIMs, several people.** Each card names a line, its own SIP username and the account rung when that SIM receives a call. Extra Telegram user ids may be authorised alongside yours; permissions are flat, so anyone listed may dial on any card, and one call runs at a time. In chat: `/call <number> [line]`, `/use <line>` to pick your default card, `/lines`, `/dtmf`, `/hangup`. An inbound call is announced before your phone rings (the Telegram call itself only names the userbot), and every call is summarised when it ends.
 
-`spike_echo.py` is still there if you want to prove Telegram audio with no SIP involved. Details, risks, and what is inferred vs transcribed: [`userbot/README.md`](userbot/README.md).
+SIP usernames have to be unique **across** lines, not merely within one — the sidecar registers them all from a single PJSUA2 endpoint, where two identical `sip:user@host` identities make an inbound call ambiguous. The control plane refuses a name another line already uses.
+
+Calls have been exercised on hardware in both directions with two SIMs. What that does and does not cover, the risks, and how to debug a call that connects with no audio: [`userbot/README.md`](userbot/README.md).
 
 ---
 
