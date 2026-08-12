@@ -51,6 +51,7 @@ from telethon.tl.types import (
     PhoneCall,
     PhoneCallAccepted,
     PhoneCallDiscarded,
+    PhoneCallDiscardReasonHangup,
     PhoneCallProtocol,
     PhoneCallRequested,
     PhoneCallWaiting,
@@ -199,6 +200,8 @@ class TelegramCallLeg:
         self._connected = False
         self._queued_signaling: list[bytes] = []
         self._signaling_ready = False
+        self._last_warning: str | None = None
+        self._started_at: float | None = None
 
     # ---------- lifecycle ----------
 
@@ -213,6 +216,13 @@ class TelegramCallLeg:
     def active(self) -> bool:
         return self._call_id is not None
 
+    def _warn_once(self, message: str):
+        """Audio callbacks fire a hundred times a second, so a broken frame path
+        would otherwise bury every other line in the log."""
+        if message != self._last_warning:
+            self._last_warning = message
+            log.warning("%s", message)
+
     async def _ntg_call(self, method, *args, deadline: float = 5.0, **kwargs):
         return await asyncio.get_running_loop().run_in_executor(
             None, lambda: _resolve(method(*args, **kwargs), deadline))
@@ -225,9 +235,12 @@ class TelegramCallLeg:
                 return
             for frame in frames:
                 try:
-                    self.on_pcm(bytes(frame))
+                    # A Frame is an object (ssrc, data, frame_data), not a buffer:
+                    # bytes(frame) raises, and losing every frame this way is a
+                    # silent one-way call, not an obvious failure.
+                    self.on_pcm(bytes(frame.data))
                 except Exception as e:  # noqa
-                    log.warning("inbound frame handler failed: %s", e)
+                    self._warn_once(f"inbound frame handler failed: {e}")
 
         @self._ntg.on_signaling
         def _signaling(chat_id, data):                   # noqa: ARG001
@@ -418,6 +431,7 @@ class TelegramCallLeg:
             # Rule 3: start pushing immediately, silence included.
             self._sender = _Sender(self._ntg, self._ntg_id)
             self._sender.start()
+            self._started_at = time.monotonic()
 
             log.info("telegram call live (call_id=%s)", self._call_id)
             if self.on_connected:
@@ -429,13 +443,18 @@ class TelegramCallLeg:
     # ---------- teardown ----------
 
     async def _discard(self, call_id=None, access_hash=None):
+        # reason is a required TLObject, so None fails at serialisation time and
+        # the request never leaves. Swallowing that quietly is how the other leg
+        # hanging up left the call still ringing on the owner's phone.
+        started = self._started_at
         try:
             await self.client(DiscardCallRequest(
                 peer=InputPhoneCall(call_id or self._call_id,
                                     access_hash or self._access_hash),
-                duration=0, reason=None, connection_id=0))
+                duration=int(time.monotonic() - started) if started else 0,
+                reason=PhoneCallDiscardReasonHangup(), connection_id=0))
         except Exception as e:  # noqa
-            log.debug("discard failed (already gone?): %s", e)
+            log.warning("could not discard call %s: %s", call_id or self._call_id, e)
 
     async def hangup(self):
         if not self.active:
@@ -457,6 +476,8 @@ class TelegramCallLeg:
         self._call_id = self._access_hash = self._ntg_id = None
         self._connected = self._signaling_ready = False
         self._queued_signaling.clear()
+        self._last_warning = None
+        self._started_at = None
 
     async def _cleanup(self):
         await self._drop_session()
