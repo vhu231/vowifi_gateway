@@ -515,6 +515,14 @@ def upsert_instance(inst: dict) -> dict:
     # instances with a computed `status` and `has_pin`); never persist them to config.
     inst = {k: v for k, v in inst.items() if k not in ("status", "has_pin")}
     existing = data["instances"].get(iid, {})
+    # An ICCID names exactly one line: it is how a physical card is matched to its config, and
+    # every lookup takes the FIRST match. Two lines sharing one would silently capture each
+    # other's card, port relearning and identity verdict, so refuse it at the door.
+    new_iccid = str(inst.get("iccid") or "").strip()
+    if new_iccid:
+        for other_id, other in data["instances"].items():
+            if str(other_id) != iid and str(other.get("iccid") or "").strip() == new_iccid:
+                raise ValueError(f"ICCID {new_iccid} already belongs to line {other_id}")
     if "index" not in existing:
         inst["index"] = next_index(data)
     else:
