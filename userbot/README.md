@@ -94,7 +94,9 @@ which costs nothing: the session and the config live on the volume, not in it.
 
 **Start refuses to run a container that has never signed in.** Telethon asks for
 the login code on stdin and a detached container has no stdin, so it would
-crash-loop rather than prompt. Do step 0 first.
+crash-loop rather than prompt. Settings → Start prints the exact
+`docker run … python spike_echo.py` command with the real host path. Do that
+once (or step 0 above) before pressing Start.
 
 By hand, if you would rather:
 

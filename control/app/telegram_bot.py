@@ -425,7 +425,7 @@ class TelegramBot:
         for token in [k for k, v in self._pending.items() if v["ts"] < cutoff]:
             self._pending.pop(token, None)
 
-    async def _handle_callback(self, cb: dict):
+    async def _handle_callback(self, cb: dict, commands: dict):
         """The outcome rewrites the question rather than answering below it. editMessageText
         without reply_markup also drops the buttons, which is what stops a second tap from
         running the action again while the first one is still going."""
@@ -443,7 +443,12 @@ class TelegramBot:
         await self._api("answerCallbackQuery", {"callback_query_id": cb.get("id")}, timeout=10)
         self._expire_pending()
         action, _, token = data.partition(":")
-        # Reader / eUICC picks are plain selections, not guarded actions.
+        # Reader / eUICC picks are plain selections, not guarded actions. Re-check the
+        # switch: an old button in the chat must not keep working after eSIM is turned off.
+        if action in ("esr", "ese") and not commands.get("allow_esim"):
+            await resolve("eSIM management is disabled for this bot "
+                          "(Settings -> Telegram -> allow eSIM).")
+            return
         if action == "esr":
             await self._select_reader(chat, int(token), self._reader_name(int(token)),
                                       resolve=resolve)
@@ -575,7 +580,12 @@ class TelegramBot:
             return
         pick = present[0]
         if arg.strip():
-            pick = next((c for c in present if str(c.get("index")) == arg.split()[0]), pick)
+            wanted = arg.split()[0]
+            pick = next((c for c in present if str(c.get("index")) == wanted), None)
+            if not pick:
+                have = ", ".join(str(c.get("index")) for c in present)
+                await self.send(chat, f"No reader {wanted}. Have: {have}")
+                return
         await self._select_reader(chat, pick.get("index"), pick.get("name"))
 
     async def _select_reader(self, chat: str, index, name: str, resolve=None):
@@ -754,8 +764,9 @@ class TelegramBot:
 
     async def _cmd_esim_download(self, chat: str, arg: str, msg: dict):
         # An activation code is single-use and worth stealing: whoever redeems it first gets
-        # the profile. Take it out of the chat history before doing anything with it.
-        await self.delete(chat, msg.get("message_id"))
+        # the profile. Take it out of the chat history before doing anything with it — but
+        # only after we know we have a reader, otherwise the code is gone and the user has
+        # to paste it again.
         code = arg.strip()
         if not code:
             await self.send(chat, "Usage: /esim_download LPA:1$smdp.example.com$MATCHINGID")
@@ -763,6 +774,7 @@ class TelegramBot:
         t = await self._need_target(chat)
         if not t:
             return
+        await self.delete(chat, msg.get("message_id"))
         body = dict(self._target_args(chat), activation_code=code)
         res, ok = await self._esim_call(
             chat, "starting the download", lambda: _routes().api_esim_download(body))
@@ -835,8 +847,14 @@ class TelegramBot:
             return
 
         # A type-this-back confirmation owns the next message from this chat, whatever it is.
-        if await self._handle_typed_confirmation(chat, text):
-            return
+        if self._typed.get(chat):
+            if not commands.get("allow_esim"):
+                self._typed.pop(chat, None)
+                await self.send(chat, "eSIM management is disabled for this bot "
+                                      "(Settings -> Telegram -> allow eSIM).")
+                return
+            if await self._handle_typed_confirmation(chat, text):
+                return
 
         # A plain reply to an incoming-SMS notification answers that conversation.
         reply_to = (msg.get("reply_to_message") or {}).get("message_id")
@@ -883,7 +901,7 @@ class TelegramBot:
             log.warning("telegram: ignoring command from unauthorised chat %s", chat_id)
             return
         if cb:
-            await self._handle_callback(cb)
+            await self._handle_callback(cb, commands)
             return
         sent_at = msg.get("date") or 0
         if sent_at and time.time() - sent_at > _STALE_UPDATE_AGE:
@@ -893,15 +911,21 @@ class TelegramBot:
 
     # ---------------- poll loop ----------------
 
-    async def _drain_backlog(self):
+    async def _drain_backlog(self) -> bool:
         """Align the offset with the newest pending update without acting on any of them.
-        offset=-1 asks for just the last one; confirming it discards everything before it."""
+        offset=-1 asks for just the last one; confirming it discards everything before it.
+        Returns False if the call failed — the caller must NOT poll without an offset, or
+        the unconfirmed backlog (up to 24h of commands) would execute."""
         ok, res = await self._api("getUpdates", {"offset": -1, "timeout": 0}, timeout=20)
-        if ok and res:
+        if not ok:
+            log.warning("telegram: could not drain backlog (%s)", (res or {}).get("error"))
+            return False
+        if res:
             self._offset = res[-1]["update_id"] + 1
             log.info("telegram: skipped %d queued update(s) from before this start", len(res))
-        elif ok:
-            self._offset = None
+        else:
+            self._offset = 0
+        return True
 
     async def run(self):
         """Poll for commands whenever the feature is switched on. Settings are re-read every
@@ -920,7 +944,9 @@ class TelegramBot:
                     self._token, self._offset = token, None
                     log.info("telegram: command polling active")
                 if self._offset is None:
-                    await self._drain_backlog()
+                    if not await self._drain_backlog():
+                        await asyncio.sleep(_ERROR_SLEEP)
+                        continue
                 await self._poll_once(tg, commands)
         except asyncio.CancelledError:
             raise

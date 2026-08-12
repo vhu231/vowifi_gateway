@@ -68,6 +68,7 @@ Hello there`}</pre>
               <li><code>/sms &lt;number&gt; &lt;text&gt;</code> — the reply updates itself to <i>delivered</i> or the failure reason.</li>
               <li><code>/msgs</code> lists recent conversations; <code>/msgs &lt;number&gt;</code> opens one.</li>
               <li>With <b>line control</b> on: <code>/line_start</code>, <code>/line_stop</code>, <code>/line_register</code>, <code>/line_reprovision</code>, <code>/pin</code>. Stopping and re-provisioning ask for confirmation first.</li>
+              <li>With <b>eSIM management</b> on: <code>/esim</code> picks the reader (and eUICC); then <code>/esim_profiles</code>, <code>/esim_enable</code>, <code>/esim_disable</code>, <code>/esim_delete</code>, <code>/esim_download</code>, <code>/esim_notify</code>. Delete asks you to type the last four ICCID digits back.</li>
               <li>Only the chats you list may command the bot; anything else is ignored without a reply.</li>
               <li>Commands older than a minute are discarded, so a queue built up while the gateway was down is never replayed.</li>
             </ul>

@@ -115,13 +115,17 @@ class Hub:
                 dead.append(ws)
         for ws in dead:
             self.clients.discard(ws)
-        # A misbehaving in-process listener must never break the event path for the WebSocket
-        # clients or for the engine-event handler that called us.
+        # Schedule, don't await: the Telegram bot's listener talks to api.telegram.org, and
+        # waiting for that here stalled every engine-event and WebSocket push behind one HTTP
+        # round trip. A misbehaving listener is still isolated from the event path.
         for fn in list(self.listeners):
-            try:
-                await fn(msg)
-            except Exception as e:  # noqa
-                log.debug("broadcast listener failed: %r", e)
+            asyncio.create_task(self._notify_listener(fn, msg))
+
+    async def _notify_listener(self, fn, msg):
+        try:
+            await fn(msg)
+        except Exception as e:  # noqa
+            log.debug("broadcast listener failed: %r", e)
 
     async def ami_for(self, iid: str) -> AmiClient | None:
         iid = str(iid)
@@ -182,10 +186,11 @@ telegram = telegram_bot.TelegramBot(hub)
 
 
 def _match_instance_by_iccid(iccid):
-    if not iccid:
+    want = (iccid or "").strip()
+    if not want:
         return None
     for i in cfg.list_instances():
-        if i.get("iccid") == iccid:
+        if (i.get("iccid") or "").strip() == want:
             return i
     return None
 
@@ -615,6 +620,7 @@ async def _auto_recover(iid: str):
             log.warning("auto-recover aborted — %s instance=%s", code, iid)
             return
 
+        inst = await _adopt_line_iccid(iid, inst, pf.get("imsi"), ctx="auto-recover")
         hub._msisdn_tries.pop(str(iid), None)
         # Keep frozen_code until start succeeds so a failed start leaves the network
         # freeze in place for the next recover interval (and recovering blocks
@@ -709,7 +715,7 @@ async def api_verify_pin(body: dict):
                                                          "present": True}
                 card_entry.update(present=True, iccid=c.iccid, imsi=c.imsi, mcc=c.mcc,
                                   mnc=c.mnc, pin_enabled=c.pin_enabled, pin_tries=c.pin_tries,
-                                  smsc=c.smsc)
+                                  smsc=c.smsc, identified=bool(c.iccid))
                 inst = _match_instance_by_iccid(c.iccid)
                 card_entry["matched"] = inst["id"] if inst else None
                 hub.cards[c.reader] = card_entry
@@ -744,7 +750,7 @@ def _refresh_card_matches():
     entries whose ICCID is known — entries mapped via a running engine's pin_status
     (identity not probed) must keep that match instead of being wiped to None."""
     for c in hub.cards.values():
-        if c.get("present") and c.get("iccid"):
+        if c.get("present") and c.get("identified") and c.get("iccid"):
             inst = _match_instance_by_iccid(c.get("iccid"))
             c["matched"] = inst["id"] if inst else None
 
@@ -921,7 +927,11 @@ def _reader_index_for_instance(inst: dict) -> int | None:
         if idx is not None and not _iccid_contradicts(idx, iccid):
             return idx
     for c in hub.cards.values():
-        if c.get("present") and iccid and (c.get("iccid") or "").strip() == iccid:
+        # Unidentified ICCIDs are leftover from a previous probe of this reader NAME and
+        # may describe a different physical card after re-enumeration. Using them as a
+        # positive match would re-point the line at the wrong socket.
+        if (c.get("present") and c.get("identified") and iccid
+                and (c.get("iccid") or "").strip() == iccid):
             return c.get("index")
     return None
 
@@ -930,10 +940,11 @@ def _reader_port_for_instance(inst: dict) -> str | None:
     """The stable USB port path this instance's SIM currently sits at. Resolved from the live
     card monitor by ICCID (the port is captured per-reader on each scan). Used to (re)learn /
     refresh a line's reader_port binding at start time so it self-heals if the SIM was moved."""
-    iccid = inst.get("iccid")
+    iccid = (inst.get("iccid") or "").strip()
     if iccid:
         for c in hub.cards.values():
-            if c.get("present") and c.get("iccid") == iccid and c.get("reader_port"):
+            if (c.get("present") and c.get("identified")
+                    and (c.get("iccid") or "").strip() == iccid and c.get("reader_port")):
                 return c.get("reader_port")
     return None
 
@@ -957,13 +968,14 @@ def _card_identity_mismatch(inst: dict) -> dict | None:
     # an index without ever looking at the card, so a stranger's SIM in that socket would still
     # count as the line being present and this whole guard would never fire.
     for c in hub.cards.values():
-        if c.get("present") and (c.get("iccid") or "").strip() == want:
+        if (c.get("present") and c.get("identified")
+                and (c.get("iccid") or "").strip() == want):
             return None      # this line's SIM/profile is present somewhere — all good
     # Prefer the stable USB port binding when present; fall back to stored index.
     port = (inst.get("reader_port") or "").strip()
     idx = inst.get("reader_index")
     for c in hub.cards.values():
-        if not c.get("present"):
+        if not c.get("present") or not c.get("identified"):
             continue
         if port and c.get("reader_port") == port:
             pass

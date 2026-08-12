@@ -196,8 +196,47 @@ Open `https://<host-ip>:<VOWIFI_PORT>` (default 8443). Tabs (see [Screenshots](#
 - **/softphone** — browser-based WebRTC dialer (click-to-call from the dashboard, or dial manually; supports inbound calls, DTMF, call recording)
 - **/messages** — SMS inbox/outbox (SIP MESSAGE ↔ carrier SMS, per instance)
 - **/esim** — eUICC profile management via local lpac (chip info, download, enable/disable/delete, notifications; dual-SE aware). Requires cloning [lpac](https://github.com/estkme-group/lpac) next to this repo and running `./install.sh build-lpac` once.
-- **/settings** — global config (TLS domain for Let's Encrypt, Asterisk debug toggles, ring timeout, etc.)
+- **/settings** — global config (TLS domain for Let's Encrypt, Asterisk debug toggles, ring timeout, Telegram bot notices/commands, Telegram-call sidecar)
 - **/logs** — call/SMS logs with filtering
+
+---
+
+## Telegram bot (two-way commands)
+
+The same bot that sends incoming-SMS / incoming-call notices can also take orders. This is **off by default**.
+
+In **Settings → Telegram**:
+
+1. Enable Telegram push and set the bot token + Chat / Channel ID (same as for notices). The token is write-only in the WebUI — leave the field blank to keep the saved one.
+2. Turn on **Accept commands (SMS, status)**.
+3. Optionally list extra chats allowed to command the bot (comma-separated). Empty = only the Chat / Channel ID above. Unlisted chats are ignored without a reply.
+4. Separately opt in to **line control** (start / stop / re-register / re-provision / PIN) and **eSIM management** (switch / download / delete profiles). Each is a different amount of trust.
+
+Commands older than a minute are discarded, so a queue built up while the gateway was down is never replayed. A PIN or eSIM activation code sent in chat is deleted from the conversation as soon as it is read; prefer entering a PIN in the WebUI.
+
+| Command | Switch | What |
+|---------|--------|------|
+| `/status`, `/lines`, `/use <line>` | Accept commands | Line state. With one SIM you never need `/use`. |
+| `/sms <number> <text>`, `/msgs` | Accept commands | Send SMS; list or open recent conversations. The send confirmation rewrites itself to delivered or the failure reason. |
+| Reply to an incoming-SMS notice | Accept commands | Answers that sender — no `/sms` needed. |
+| `/line_start`, `/line_stop`, `/line_register`, `/line_reprovision`, `/pin` | + line control | Stop and re-provision ask for confirmation first. |
+| `/esim`, `/esim_profiles`, `/esim_enable`, `/esim_disable`, `/esim_delete`, `/esim_download`, `/esim_notify`, `/esim_notify_process` | + eSIM | Addressed by reader (and eUICC on dual-SE cards), not by line. `/esim` picks the target; that choice expires after a few minutes. Delete asks you to type the last four ICCID digits back. If a line is using the reader, the bot offers to stop it, run the operation, and start it again. |
+
+Send `/help` in the chat for the live list.
+
+---
+
+## Telegram calls (userbot) — UNTESTED
+
+A bot account cannot join a Telegram voice call. Bridging Telegram calls to a SIM therefore needs a **second Telegram user account** and a separate container (`vowifi/userbot`).
+
+Configure it in **Settings → Telegram calls (userbot)**: API id / hash (from [my.telegram.org/apps](https://my.telegram.org/apps)), the account phone number, your numeric Telegram user id (from [@userinfobot](https://t.me/userinfobot)), and an external SIP account username on the line you want (add that account under **SIM Config → External SIP accounts**). Save and Start are separate from the rest of Settings — the sidecar reads its own `data/userbot/config.json` once at startup, so Restart is what applies a change.
+
+**Telegram calls (userbot / ntgcalls / the SIP bridge) have not been tested on real hardware.** Treat this as a first draft to debug, not as something that works.
+
+First login is a one-time terminal step. Telethon asks for the SMS login code on stdin; a detached container has no stdin, so **Start refuses until a session exists** and prints the exact `docker run … python spike_echo.py` command with the real host path. `spike_echo.py` answers a Telegram call and plays you back to yourself, with no SIP involved — if that does not pass, the bridge cannot work.
+
+Build the image first (`docker build -f userbot/Dockerfile -t vowifi/userbot .`; this compiles PJSIP). Details, risks, and what is inferred vs transcribed: [`userbot/README.md`](userbot/README.md).
 
 ---
 
