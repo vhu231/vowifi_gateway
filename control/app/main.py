@@ -1292,10 +1292,8 @@ def api_put_settings(body: dict):
 # I/O, and FastAPI runs a non-async endpoint in a worker thread, off the loop.
 @app.get("/api/userbot")
 def api_userbot():
-    """Config, what the sidecar last reported, and what Docker thinks of its
-    container. The two processes only meet through the shared data dir."""
-    return {"config": userbot.public(), "status": userbot.status(),
-            "container": userbot.container(), "signed_in": userbot.signed_in()}
+    """Config, heartbeat, Docker state, image/build, and whether a login code is pending."""
+    return userbot.snapshot()
 
 
 @app.put("/api/userbot")
@@ -1305,31 +1303,31 @@ def api_userbot_save(body: dict):
     except ValueError as e:
         raise HTTPException(400, detail={"code": "invalid_userbot_config",
                                          "message": str(e)}) from e
-    # The sidecar reads its config once, at startup.
     return {"config": saved, "restart_required": userbot.container().get("state") == "running"}
 
 
 @app.post("/api/userbot/start")
 def api_userbot_start(body: dict | None = None):
-    """Also the restart button: starting recreates the container, so a config
-    change and a plain restart are the same operation. The optional body is the
-    form from the WebUI — Start used to read the file on disk and ignore whatever
-    the user had just typed."""
-    if body:
-        try:
-            userbot.update(body)
-        except ValueError as e:
-            raise HTTPException(400, detail={"code": "invalid_userbot_config",
-                                             "message": str(e)}) from e
+    """Save, create the SIP account if needed, build the image, collect the
+    Telegram login code, then start. The WebUI treats a non-running `phase` as
+    the next step rather than as an error."""
     try:
-        userbot.start_container()
+        return userbot.prepare_and_start(body)
     except userbot.NotReady as e:
         raise HTTPException(409, detail={"code": "userbot_not_ready",
                                          "message": str(e)}) from e
     except Exception as e:  # noqa
         raise HTTPException(500, detail={"code": "userbot_start_failed",
                                          "message": str(e)}) from e
-    return {"ok": True, "container": userbot.container(), "config": userbot.public()}
+
+
+@app.post("/api/userbot/login/resend")
+def api_userbot_resend():
+    try:
+        return userbot.send_login_code(force=True)
+    except userbot.NotReady as e:
+        raise HTTPException(409, detail={"code": "userbot_not_ready",
+                                         "message": str(e)}) from e
 
 
 @app.post("/api/userbot/stop")

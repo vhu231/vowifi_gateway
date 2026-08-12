@@ -70,33 +70,26 @@ community findings, not documented API — hence this step.
 
 ## Step 1: the SIP side
 
-Create an external SIP account in the WebUI under **SIM Config → External SIP
-accounts** (for example `tgbridge` with a password) and put it in `config.json`.
 Nothing in the engine image changes: the inbound dialplan already rings every
 external account, and an INVITE from one lands in `from-local`, which hairpins
 it to the IMS trunk.
 
-Build the image once. This compiles PJSIP, which takes a while on a Pi:
-
-```bash
-docker build -f userbot/Dockerfile -t vowifi/userbot .
-```
-
-From there, **Settings → Telegram calls (userbot)** in the WebUI runs the thing:
-the same fields as `config.json`, Start / Restart / Stop, the container's log, and
-what the sidecar last reported — Telegram connected, SIP registered, in a call, or
-a startup error such as a missing external account.
+**Settings → Telegram calls (userbot)** is the whole setup. Fill API id / hash,
+the spare account's phone, and your numeric user id, then press **Start**. That
+one action builds `vowifi/userbot` if the image is missing (PJSIP compile; the
+page shows the log), creates the `tgbridge` SIP account on the chosen line if
+it is missing, sends the Telegram login code, and starts the sidecar once you
+type the code (and 2FA password, if asked) in the same card.
 
 Both directions are plain files on the shared volume; the control plane never
-talks to this container, it only asks Docker to run it. Config is read once at
+talks to this container, it only asks Docker to run it (and, for first login,
+uses Telethon in the manager to write the session file). Config is read once at
 startup, so Restart is what applies a change. Restart recreates the container,
 which costs nothing: the session and the config live on the volume, not in it.
 
-**Start refuses to run a container that has never signed in.** Telethon asks for
-the login code on stdin and a detached container has no stdin, so it would
-crash-loop rather than prompt. Settings → Start prints the exact
-`docker run … python spike_echo.py` command with the real host path. Do that
-once (or step 0 above) before pressing Start.
+The login code is entered in Settings. A detached container has no stdin, so
+Start will not launch the sidecar until a session exists. `spike_echo.py` remains
+as a no-SIP audio probe if you want it.
 
 By hand, if you would rather:
 

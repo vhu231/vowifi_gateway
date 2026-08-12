@@ -2,29 +2,74 @@ import React, { useEffect, useState } from 'react'
 import { api } from '../api.js'
 import PushInfoModal from './PushInfoModal.jsx'
 
-export default function Settings() {
+function applyUbStart(r, setUb, setUbInfo, setUbMsg, setUbCode, setUbPassword) {
+  if (r.config) setUb(r.config)
+  setUbInfo(r)
+  const notes = (r.notes || []).filter(Boolean).join(' ')
+  if (r.phase === 'building') {
+    setUbMsg('Building the userbot image (first time compiles PJSIP — this can take a while).' + (notes ? '\n' + notes : ''))
+    return
+  }
+  if (r.phase === 'login') {
+    setUbCode('')
+    setUbMsg('Telegram sent a login code to the account phone. Enter it below, then press Start.' + (notes ? '\n' + notes : ''))
+    return
+  }
+  if (r.phase === 'password') {
+    setUbPassword('')
+    setUbMsg('This account has two-factor authentication. Enter the cloud password, then press Start.')
+    return
+  }
+  if (r.ok || r.phase === 'running') {
+    setUbCode('')
+    setUbPassword('')
+    setUbMsg('Started.' + (notes ? ' ' + notes : ''))
+    return
+  }
+  setUbMsg(notes || 'Done.')
+}
+
+export default function Settings({ instances = [] }) {
   const [s, setS] = useState(null)
   const [msg, setMsg] = useState('')
   const [info, setInfo] = useState('')   // '' | 'webhook' | 'telegram' — which help modal is open
   // The call sidecar lives in its own container and its own config file, so it
   // loads and saves through a separate endpoint from everything else here.
   const [ub, setUb] = useState(null)        // the editable form
-  const [ubInfo, setUbInfo] = useState({})  // status + container + signed_in
+  const [ubInfo, setUbInfo] = useState({})  // status + container + signed_in + build + login
   const [ubMsg, setUbMsg] = useState('')
   const [ubBusy, setUbBusy] = useState(false)
   const [ubLogs, setUbLogs] = useState(null)
+  const [ubCode, setUbCode] = useState('')
+  const [ubPassword, setUbPassword] = useState('')
+  const ubRef = React.useRef(null)
+  const waitBuild = React.useRef(false)
 
   useEffect(() => { api.settings().then(setS).catch(() => {}) }, [])
-  // The sidecar cannot tell us it died; it writes a heartbeat and we poll it.
+  const building = !!ubInfo.build?.running
   useEffect(() => {
+    let alive = true
     const pull = () => api.userbot().then((r) => {
-      setUb((cur) => cur || r.config)     // never clobber a half-typed form
+      if (!alive) return
+      setUb((cur) => cur || r.config)
       setUbInfo(r)
-    }).catch(() => {})                    // transient; the next tick tries again
+      if (waitBuild.current && r.build && !r.build.running) {
+        waitBuild.current = false
+        if (r.build.ok) {
+          setUbMsg('Image ready. Continuing…')
+          api.userbotStart(ubRef.current || r.config).then((next) => {
+            if (!alive) return
+            applyUbStart(next, setUb, setUbInfo, setUbMsg, setUbCode, setUbPassword)
+          }).catch((e) => { if (alive) setUbMsg('Error: ' + e.message) })
+        } else {
+          setUbMsg('Error: image build failed — open the log below')
+        }
+      }
+    }).catch(() => {})
     pull()
-    const timer = setInterval(pull, 10000)
-    return () => clearInterval(timer)
-  }, [])
+    const timer = setInterval(pull, building ? 2000 : 10000)
+    return () => { alive = false; clearInterval(timer) }
+  }, [building])
   if (!s) return <div style={{ color: 'var(--text-dim)' }}>Loading…</div>
 
   const upd = (patch) => setS((x) => ({ ...x, ...patch }))
@@ -49,7 +94,13 @@ export default function Settings() {
   // container can be up while the process inside it is failing to sign in.
   const ubBox = ubInfo.container || {}
   const ubRunning = ubBox.state === 'running'
-  const updUb = (patch) => setUb((x) => ({ ...x, ...patch }))
+  const ubLogin = ubInfo.login || {}
+  const updUb = (patch) => setUb((x) => {
+    const next = { ...x, ...patch }
+    ubRef.current = next
+    return next
+  })
+  React.useEffect(() => { ubRef.current = ub }, [ub])
   const refreshUb = () => api.userbot().then(setUbInfo).catch(() => {})
   const saveUb = async () => {
     try {
@@ -62,14 +113,14 @@ export default function Settings() {
     }
     catch (e) { setUbMsg('Error: ' + e.message) }
   }
-  // Start doubles as restart: the server recreates the container either way.
   const ubAct = async (call, verb) => {
     setUbBusy(true)
     setUbMsg(`${verb}…`)
     try {
       const r = await call()
-      if (r && r.config) setUb(r.config)
-      setUbMsg(`${verb} done.`)
+      if (r && r.phase === 'building') waitBuild.current = true
+      applyUbStart(r, setUb, setUbInfo, setUbMsg, setUbCode, setUbPassword)
+      if (r && r.config) ubRef.current = r.config
       setUbLogs(null)
     }
     catch (e) { setUbMsg('Error: ' + e.message) }
@@ -78,6 +129,14 @@ export default function Settings() {
       refreshUb()
     }
   }
+  const startUb = () => ubAct(
+    () => api.userbotStart({
+      ...(ub || {}),
+      login_code: ubCode,
+      login_password: ubPassword,
+    }),
+    ubRunning ? 'Restarting' : (ubLogin.pending || ubLogin.need_password ? 'Signing in' : 'Starting'),
+  )
   const showUbLogs = async () => {
     if (ubLogs !== null) { setUbLogs(null); return }
     try { setUbLogs((await api.userbotLogs()).logs || '(the container has no log yet)') }
@@ -334,10 +393,10 @@ export default function Settings() {
           <UserbotPill info={ubInfo} />
         </div>
         <div style={{ fontSize: 13, color: 'var(--text-dim)', margin: '8px 0 12px', lineHeight: 1.55 }}>
-          Bridges Telegram voice calls to this gateway's SIM, so you can dial a real number from
-          Telegram and take incoming calls there. It needs a <b>second Telegram account</b> (a bot
-          token cannot place calls) and runs in its own container, which is why it is configured
-          here but saved and restarted separately.
+          Bridges Telegram voice calls to this gateway's SIM. It needs a <b>second Telegram
+          account</b> (a bot token cannot place calls). Fill the fields and press Start — the
+          image is built if missing, a SIP account is created on the line if missing, and the
+          login code Telegram sends is entered here. Call path still untested on real hardware.
         </div>
         {!ub ? <div style={{ color: 'var(--text-dim)', fontSize: 13 }}>Loading…</div> : <>
           <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
@@ -372,33 +431,71 @@ export default function Settings() {
                 placeholder="blank = read it from the line" /></div>
           </div>
           <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginTop: 6, lineHeight: 1.5 }}>
-            Add an external account with this username on the line you want to use (Lines → SIP
-            accounts). Left blank, the password is read from that account automatically.
+            Leave the password blank. Start creates <code>{ub.sip_user || 'tgbridge'}</code> on the
+            line below if that account is missing, and the sidecar reads the password from the line.
           </div>
           <div style={{ marginTop: 10 }}>
-            <label>Line id</label>
-            <input className="mono" value={ub.sip_line || ''}
-              onChange={(e) => updUb({ sip_line: e.target.value })} placeholder="blank = first configured line" />
+            <label>Line</label>
+            <select className="mono" value={ub.sip_line || ''}
+              onChange={(e) => updUb({ sip_line: e.target.value })}>
+              <option value="">first configured line</option>
+              {(instances || []).map((i) => (
+                <option key={i.id} value={String(i.id)}>
+                  {`line ${i.id}`
+                    + (i.msisdn ? ` · ${i.msisdn}` : '')
+                    + (i.iccid ? ` · …${String(i.iccid).slice(-4)}` : '')}
+                </option>
+              ))}
+            </select>
+            {!instances.length &&
+              <div style={{ fontSize: 11.5, color: '#f59e0b', marginTop: 6 }}>
+                Add a SIM under SIM Config first — Start needs a line to attach the SIP account to.
+              </div>}
           </div>
           <div style={{ marginTop: 10 }}>
             <label>Numbers it may dial (comma separated)</label>
-            {/* Kept as raw text while typing — splitting on every keystroke would eat the
-                comma you just typed. The server splits it on save. */}
             <input className="mono"
               value={Array.isArray(ub.dial_allowlist) ? ub.dial_allowlist.join(', ') : (ub.dial_allowlist || '')}
               onChange={(e) => updUb({ dial_allowlist: e.target.value })}
               placeholder="empty = any number" />
           </div>
 
+          {(ubLogin.pending || ubLogin.need_password || !ubInfo.signed_in) &&
+            <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
+              <div>
+                <label>Telegram login code</label>
+                <input className="mono" value={ubCode} autoComplete="one-time-code"
+                  onChange={(e) => setUbCode(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') startUb() }}
+                  placeholder={ubLogin.pending ? 'sent to the account phone' : 'press Start to send'} />
+              </div>
+              {ubLogin.need_password &&
+                <div>
+                  <label>Cloud password (2FA)</label>
+                  <input className="mono" type="password" value={ubPassword}
+                    onChange={(e) => setUbPassword(e.target.value)} placeholder="Telegram two-step password" />
+                </div>}
+            </div>}
+
           <div style={{ marginTop: 14, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <button className="btn" onClick={saveUb} disabled={ubBusy}>Save</button>
-            <button className="btn" disabled={ubBusy}
-              onClick={() => ubAct(() => api.userbotStart(ub), ubRunning ? 'Restarting' : 'Starting')}>
-              {ubRunning ? 'Restart' : 'Start'}
+            <button className="btn" disabled={ubBusy || building} onClick={startUb}>
+              {building ? 'Building…' : ubRunning ? 'Restart' : (ubLogin.pending || ubLogin.need_password ? 'Confirm & start' : 'Start')}
             </button>
             {ubBox.exists &&
               <button className="btn btn-ghost" disabled={ubBusy}
                 onClick={() => ubAct(api.userbotStop, 'Stopping')}>Stop</button>}
+            {ubLogin.pending &&
+              <button className="btn btn-ghost" disabled={ubBusy}
+                onClick={async () => {
+                  setUbBusy(true)
+                  try {
+                    await api.userbotResendCode()
+                    setUbMsg('A new login code was sent.')
+                    refreshUb()
+                  } catch (e) { setUbMsg('Error: ' + e.message) }
+                  finally { setUbBusy(false) }
+                }}>Resend code</button>}
             <button className="btn btn-ghost" onClick={showUbLogs}>
               {ubLogs === null ? 'Log' : 'Hide log'}
             </button>
@@ -407,21 +504,17 @@ export default function Settings() {
             marginTop: 8, fontSize: 12.5, whiteSpace: 'pre-wrap', lineHeight: 1.6,
             color: ubMsg.startsWith('Error') ? '#ef4444' : '#22c55e',
           }}>{ubMsg}</div>}
-          {ubLogs !== null &&
+          {(building || (ubInfo.build && ubInfo.build.log && !ubInfo.image_present) || ubLogs !== null) &&
             <pre className="mono" style={{
               marginTop: 10, maxHeight: 260, overflow: 'auto', fontSize: 11.5, lineHeight: 1.5,
               background: 'var(--bg-deep, #0b0f16)', padding: 10, borderRadius: 6,
               whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-            }}>{ubLogs}</pre>}
-          {!ubInfo.signed_in &&
-            <div style={{ fontSize: 11.5, color: '#f59e0b', marginTop: 10, lineHeight: 1.6 }}>
-              This account has not logged in to Telegram yet. The code arrives by SMS and has to be
-              typed at a terminal on the gateway, once — Start will refuse until then and show the
-              exact command.
-            </div>}
+            }}>{(building || (ubInfo.build && ubInfo.build.log && !ubInfo.image_present))
+              ? (ubInfo.build?.log || 'starting build…')
+              : ubLogs}</pre>}
           <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginTop: 10, lineHeight: 1.6 }}>
-            Restart recreates the container, so it also applies whatever you just saved. The image
-            has to exist first: <code>docker build -f userbot/Dockerfile -t vowifi/userbot .</code>
+            Restart recreates the container, so it also applies whatever you just saved.
+            First image build compiles PJSIP and can take a long time on a Pi.
           </div>
         </>}
       </div>
@@ -453,6 +546,10 @@ function UserbotPill({ info }) {
   const Row = ({ children }) =>
     <span style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>{children}</span>
 
+  if (info.build?.running) return <Row>{pill('Building image', '#f59e0b')}</Row>
+  if (!box.exists && info.image_present === false) {
+    return <Row>{pill('Image not built', '#94a3b8')}{note('press Start')}</Row>
+  }
   if (!box.exists) return <Row>{pill('Not created', '#94a3b8')}{note('press Start')}</Row>
   if (box.state !== 'running') return <Row>{pill(box.state || 'stopped', '#94a3b8')}</Row>
   if (!st.running) {

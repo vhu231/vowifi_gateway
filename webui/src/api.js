@@ -64,6 +64,7 @@ export const api = {
   userbotStart: (patch) => j('POST', '/api/userbot/start', patch || {}),
   userbotStop: () => j('POST', '/api/userbot/stop'),
   userbotLogs: (tail = 200) => j('GET', `/api/userbot/logs?tail=${tail}`),
+  userbotResendCode: () => j('POST', '/api/userbot/login/resend'),
 
   instances: () => j('GET', '/api/instances'),
   cards: () => j('GET', '/api/cards'),

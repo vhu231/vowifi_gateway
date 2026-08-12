@@ -230,13 +230,19 @@ Send `/help` in the chat for the live list.
 
 A bot account cannot join a Telegram voice call. Bridging Telegram calls to a SIM therefore needs a **second Telegram user account** and a separate container (`vowifi/userbot`).
 
-Configure it in **Settings → Telegram calls (userbot)**: API id / hash (from [my.telegram.org/apps](https://my.telegram.org/apps)), the account phone number, your numeric Telegram user id (from [@userinfobot](https://t.me/userinfobot)), and an external SIP account username on the line you want (add that account under **SIM Config → External SIP accounts**). Save and Start are separate from the rest of Settings — the sidecar reads its own `data/userbot/config.json` once at startup, so Restart is what applies a change.
+Configure it in **Settings → Telegram calls (userbot)**: API id / hash (from [my.telegram.org/apps](https://my.telegram.org/apps)), the spare account's phone number (`+…`), and your numeric Telegram user id (from [@userinfobot](https://t.me/userinfobot)). Pick the SIM line. Press **Start**. That one action:
+
+1. Writes `data/userbot/config.json`
+2. Creates the external SIP account (`tgbridge` by default) on the chosen line if it is missing, and reloads PJSIP on a running engine
+3. Builds `vowifi/userbot` if the image is not present (first build compiles PJSIP; the page shows the log)
+4. Sends the Telegram login code to the spare account; type it (and the 2FA cloud password if asked) in the same card
+5. Starts the sidecar
+
+After that, Restart applies config changes. The control plane needs `telethon` in its venv (`sudo ./install.sh reload` on an existing install).
 
 **Telegram calls (userbot / ntgcalls / the SIP bridge) have not been tested on real hardware.** Treat this as a first draft to debug, not as something that works.
 
-First login is a one-time terminal step. Telethon asks for the SMS login code on stdin; a detached container has no stdin, so **Start refuses until a session exists** and prints the exact `docker run … python spike_echo.py` command with the real host path. `spike_echo.py` answers a Telegram call and plays you back to yourself, with no SIP involved — if that does not pass, the bridge cannot work.
-
-Build the image first (`docker build -f userbot/Dockerfile -t vowifi/userbot .`; this compiles PJSIP). Details, risks, and what is inferred vs transcribed: [`userbot/README.md`](userbot/README.md).
+`spike_echo.py` is still there if you want to prove Telegram audio with no SIP involved. Details, risks, and what is inferred vs transcribed: [`userbot/README.md`](userbot/README.md).
 
 ---
 

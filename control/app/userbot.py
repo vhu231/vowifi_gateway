@@ -19,9 +19,12 @@ the volume, so nothing is lost and one code path covers start, restart and
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import secrets
+import threading
 import time
 
 import docker
@@ -30,6 +33,29 @@ from . import config as cfg
 from . import engine
 
 log = logging.getLogger("vowifi.userbot")
+
+try:
+    from telethon import TelegramClient
+    from telethon.errors import (
+        FloodWaitError,
+        PhoneCodeExpiredError,
+        PhoneCodeInvalidError,
+        SessionPasswordNeededError,
+    )
+except ImportError:  # pragma: no cover - venv before `install.sh reload`
+    TelegramClient = None
+
+    class FloodWaitError(Exception):
+        seconds = 0
+
+    class PhoneCodeExpiredError(Exception):
+        pass
+
+    class PhoneCodeInvalidError(Exception):
+        pass
+
+    class SessionPasswordNeededError(Exception):
+        pass
 
 CONTAINER = "vowifi-userbot"
 IMAGE = os.environ.get("VOWIFI_USERBOT_IMAGE", "vowifi/userbot")
@@ -41,6 +67,11 @@ class NotReady(Exception):
 # Anything older than this and we call the sidecar offline. Comfortably above the
 # sidecar's own write interval so a slow board doesn't look dead.
 STALE_AFTER = 30
+LOGIN_TTL = 600
+BUILD_LOG_LIMIT = 200_000
+
+_build_lock = threading.Lock()
+_build_thread: threading.Thread | None = None
 
 DEFAULTS = {
     "api_id": 0,
@@ -69,6 +100,20 @@ def config_path() -> str:
 
 def status_path() -> str:
     return os.path.join(_dir(), "status.json")
+
+
+def _login_path() -> str:
+    return os.path.join(_dir(), "login_state.json")
+
+
+def _build_path() -> str:
+    return os.path.join(_dir(), "build.json")
+
+
+def _host_session() -> str:
+    """Telethon session path on THIS process's filesystem (no .session suffix)."""
+    os.makedirs(_dir(), exist_ok=True)
+    return os.path.join(_dir(), "userbot")
 
 
 def load() -> dict:
@@ -180,6 +225,359 @@ def signed_in() -> bool:
     return False
 
 
+def snapshot() -> dict:
+    login = _read_login()
+    pending = bool(login.get("phone_code_hash")) and not signed_in()
+    return {
+        "config": public(),
+        "status": status(),
+        "container": container(),
+        "signed_in": signed_in(),
+        "image_present": image_present(),
+        "build": build_status(),
+        "login": {
+            "pending": pending,
+            "need_password": bool(login.get("need_password")),
+            "phone": login.get("phone") or "",
+        },
+    }
+
+
+# ----------------------------- Telegram login (WebUI) -----------------------------
+
+def _read_login() -> dict:
+    try:
+        with open(_login_path(), encoding="utf-8") as f:
+            st = json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    if time.time() - float(st.get("ts") or 0) > LOGIN_TTL:
+        _clear_login()
+        return {}
+    return st
+
+
+def _write_login(st: dict):
+    os.makedirs(_dir(), exist_ok=True)
+    tmp = _login_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.replace(tmp, _login_path())
+
+
+def _clear_login():
+    try:
+        os.remove(_login_path())
+    except FileNotFoundError:
+        pass
+
+
+def _tg_run(coro):
+    return asyncio.run(coro)
+
+
+async def _with_client(conf: dict, fn):
+    if TelegramClient is None:
+        raise NotReady("telethon is not installed in the control plane — "
+                       "on the gateway: sudo ./install.sh reload")
+    api_id = int(conf.get("api_id") or 0)
+    api_hash = str(conf.get("api_hash") or "").strip()
+    if not api_id or not api_hash:
+        raise NotReady("API ID and API hash are required to log in")
+    client = TelegramClient(_host_session(), api_id, api_hash)
+    await client.connect()
+    try:
+        return await fn(client)
+    finally:
+        await client.disconnect()
+
+
+def send_login_code(force: bool = False) -> dict:
+    """Ask Telegram to SMS the login code. Stops the sidecar first so it cannot
+    hold the session file open."""
+    if container().get("state") == "running":
+        stop_container()
+    conf = load()
+    phone = str(conf.get("phone") or "").strip()
+    if not phone:
+        raise NotReady("the account phone number is empty")
+    existing = _read_login()
+    if (not force and existing.get("phone_code_hash")
+            and existing.get("phone") == phone
+            and time.time() - float(existing.get("ts") or 0) < 45):
+        return {"ok": True, "phone": phone, "resent": False}
+
+    async def _send(client):
+        sent = await client.send_code_request(phone)
+        return sent.phone_code_hash
+
+    try:
+        phone_code_hash = _tg_run(_with_client(conf, _send))
+    except FloodWaitError as e:
+        wait = int(getattr(e, "seconds", 0) or 0)
+        raise NotReady(f"Telegram asked us to wait {wait}s before sending another code") from e
+    except NotReady:
+        raise
+    except Exception as e:
+        raise NotReady(f"could not send the login code: {e}") from e
+    _write_login({"phone": phone, "phone_code_hash": phone_code_hash,
+                  "need_password": False, "ts": time.time()})
+    log.info("userbot login code sent to %s", phone)
+    return {"ok": True, "phone": phone, "resent": True}
+
+
+def confirm_login(code: str = "", password: str = "") -> dict:
+    """Complete the login. `code` is the SMS; `password` is 2FA if Telegram asks."""
+    conf = load()
+    st = _read_login()
+    phone = st.get("phone") or str(conf.get("phone") or "").strip()
+    if not phone:
+        raise NotReady("send a login code first")
+
+    async def _sign(client):
+        if password:
+            await client.sign_in(password=password)
+            return "ok"
+        if not code:
+            raise NotReady("enter the login code Telegram sent")
+        hash_ = st.get("phone_code_hash") or ""
+        await client.sign_in(phone, code, phone_code_hash=hash_)
+        return "ok"
+
+    try:
+        _tg_run(_with_client(conf, _sign))
+    except SessionPasswordNeededError:
+        st["need_password"] = True
+        st["ts"] = time.time()
+        _write_login(st)
+        return {"ok": False, "need_password": True}
+    except PhoneCodeInvalidError as e:
+        raise NotReady("that login code was rejected") from e
+    except PhoneCodeExpiredError as e:
+        _clear_login()
+        raise NotReady("that login code expired — press Start to send a new one") from e
+    except FloodWaitError as e:
+        wait = int(getattr(e, "seconds", 0) or 0)
+        raise NotReady(f"Telegram asked us to wait {wait}s") from e
+    except NotReady:
+        raise
+    except Exception as e:
+        raise NotReady(f"login failed: {e}") from e
+    _clear_login()
+    log.info("userbot Telegram session saved under %s", _dir())
+    return {"ok": True, "signed_in": True}
+
+
+# ----------------------------- image build -----------------------------
+
+def repo_dir() -> str:
+    env = (os.environ.get("VOWIFI_REPO") or "").strip()
+    if env and os.path.isfile(os.path.join(env, "userbot", "Dockerfile")):
+        return env
+    here = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if os.path.isfile(os.path.join(here, "userbot", "Dockerfile")):
+        return here
+    raise NotReady("cannot find userbot/Dockerfile. Set VOWIFI_REPO to the repo root, "
+                   "or on the gateway: sudo ./install.sh reload")
+
+
+def image_present() -> bool:
+    try:
+        engine.client().images.get(IMAGE)
+        return True
+    except docker.errors.ImageNotFound:
+        return False
+    except docker.errors.DockerException:
+        engine.reset_client()
+        return False
+
+
+def build_status() -> dict:
+    try:
+        with open(_build_path(), encoding="utf-8") as f:
+            st = json.load(f) or {}
+    except FileNotFoundError:
+        st = {}
+    except Exception:
+        st = {}
+    st.setdefault("running", False)
+    st.setdefault("log", "")
+    st.setdefault("ok", image_present() if not st.get("running") else False)
+    st["image_present"] = image_present()
+    return st
+
+
+def _write_build(st: dict):
+    os.makedirs(_dir(), exist_ok=True)
+    log_text = st.get("log") or ""
+    if len(log_text) > BUILD_LOG_LIMIT:
+        st["log"] = log_text[-BUILD_LOG_LIMIT:]
+    tmp = _build_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    last = None
+    for _ in range(8):
+        try:
+            os.replace(tmp, _build_path())
+            return
+        except PermissionError as e:
+            last = e
+            time.sleep(0.05)
+    if last:
+        raise last
+
+
+def start_build() -> dict:
+    global _build_thread
+    with _build_lock:
+        st = build_status()
+        if st.get("running"):
+            return st
+        repo = repo_dir()
+        st = {"running": True, "ok": False, "log": f"building {IMAGE} from {repo}\n",
+              "started": time.time()}
+        _write_build(st)
+        _build_thread = threading.Thread(target=_run_build, args=(repo,), daemon=True)
+        _build_thread.start()
+    return build_status()
+
+
+def _run_build(repo: str):
+    st = build_status()
+    try:
+        gen = engine.client().api.build(
+            path=repo, dockerfile="userbot/Dockerfile", tag=IMAGE,
+            rm=True, decode=True,
+        )
+        for chunk in gen:
+            if not isinstance(chunk, dict):
+                continue
+            line = chunk.get("stream") or chunk.get("status") or ""
+            if chunk.get("error"):
+                line = chunk["error"]
+            if line:
+                st["log"] = (st.get("log") or "") + line
+                if not line.endswith("\n"):
+                    st["log"] += "\n"
+                _write_build(st)
+            if chunk.get("error"):
+                raise RuntimeError(chunk["error"])
+        st["running"] = False
+        st["ok"] = image_present()
+        if not st["ok"]:
+            st["log"] = (st.get("log") or "") + "build finished but the image is still missing\n"
+        _write_build(st)
+        log.info("userbot image build %s", "ok" if st["ok"] else "failed")
+    except Exception as e:  # noqa
+        st["running"] = False
+        st["ok"] = False
+        st["log"] = (st.get("log") or "") + f"build failed: {e}\n"
+        _write_build(st)
+        log.warning("userbot image build failed: %s", e)
+
+
+# ----------------------------- SIP account -----------------------------
+
+def _require_start_fields(conf: dict):
+    """Fail before a 20-minute image build, not after."""
+    missing = []
+    if not int(conf.get("api_id") or 0):
+        missing.append("API ID")
+    if not str(conf.get("api_hash") or "").strip():
+        missing.append("API hash")
+    if not str(conf.get("phone") or "").strip():
+        missing.append("account phone number")
+    if not int(conf.get("owner_id") or 0):
+        missing.append("your Telegram user ID")
+    if missing:
+        raise NotReady("fill in " + ", ".join(missing) + " first")
+    phone = str(conf.get("phone") or "").strip()
+    if not phone.startswith("+"):
+        raise NotReady("the account phone number must be in international form, starting with +")
+
+
+def ensure_sip_account(conf: dict) -> str | None:
+    """Create the external SIP account on the target line if it is missing.
+    A running engine is re-rendered and PJSIP reloaded so the userbot can
+    register without a full line restart."""
+    user = str(conf.get("sip_user") or "tgbridge").strip()
+    if not user:
+        raise NotReady("the SIP username is empty")
+    instances = cfg.list_instances()
+    if not instances:
+        raise NotReady("no SIM line is configured yet — add one under SIM Config first")
+    wanted = str(conf.get("sip_line") or "").strip()
+    inst = cfg.get_instance(wanted) if wanted else instances[0]
+    if not inst:
+        raise NotReady(f"no line {wanted}")
+    iid = str(inst["id"])
+    if not wanted:
+        update({"sip_line": iid})
+        conf["sip_line"] = iid
+    sip = dict(inst.get("sip") or {})
+    external = [a for a in (sip.get("external") or []) if isinstance(a, dict)]
+    if any(str(a.get("username") or "").strip() == user for a in external):
+        return None
+    password = str(conf.get("sip_password") or "").strip() or secrets.token_urlsafe(12)
+    external.append({"username": user, "password": password})
+    try:
+        inst = cfg.upsert_instance({"id": iid, "sip": {**sip, "external": external}})
+    except ValueError as e:
+        raise NotReady(str(e)) from e
+    if engine.is_running(iid):
+        settings = (cfg.load() or {}).get("settings") or {}
+        cfg.write_instance_json(inst, settings)
+        result = engine.rerender(iid)
+        if result != "ok":
+            log.warning("userbot: added SIP account %s on line %s but reload said %s",
+                        user, iid, result)
+            return (f"created SIP account {user} on line {iid}, but the running engine "
+                    f"did not reload ({result}) — Stop → Start that line")
+    log.info("created external SIP account %s on line %s", user, iid)
+    return f"created SIP account {user} on line {iid}"
+
+
+def prepare_and_start(body: dict | None = None) -> dict:
+    """One WebUI action: save, ensure SIP, build image, log in, start."""
+    body = dict(body or {})
+    code = str(body.pop("login_code", "") or "").strip()
+    password = str(body.pop("login_password", "") or "").strip()
+    resend = bool(body.pop("resend_code", False))
+    if body:
+        try:
+            update(body)
+        except ValueError as e:
+            raise NotReady(str(e)) from e
+    conf = load()
+    _require_start_fields(conf)
+    notes: list[str] = []
+    sip_note = ensure_sip_account(conf)
+    if sip_note:
+        notes.append(sip_note)
+
+    if not image_present():
+        start_build()
+        return {**snapshot(), "ok": False, "phase": "building", "notes": notes}
+    if build_status().get("running"):
+        return {**snapshot(), "ok": False, "phase": "building", "notes": notes}
+
+    pending = _read_login()
+    if ((code and pending.get("phone_code_hash"))
+            or (password and pending.get("need_password"))):
+        result = confirm_login(code=code, password=password)
+        if result.get("need_password"):
+            return {**snapshot(), "ok": False, "phase": "password", "notes": notes}
+
+    if not signed_in():
+        send_login_code(force=resend)
+        return {**snapshot(), "ok": False, "phase": "login", "notes": notes}
+
+    start_container()
+    return {**snapshot(), "ok": True, "phase": "running", "notes": notes}
+
+
 def _clear_status():
     """Drop the last heartbeat. Restart would otherwise keep showing the previous
     process as healthy until STALE_AFTER, because the file lives on the volume."""
@@ -226,10 +624,8 @@ def start_container() -> str:
         raise NotReady(f"the userbot is not configured yet — {', '.join(missing)} still empty")
     host_dir = os.path.join(engine.HOST_DATA_DIR, "userbot")
     if not signed_in():
-        raise NotReady(
-            "this Telegram account has not logged in yet. Telegram sends the code by SMS "
-            "and it has to be typed at a terminal on the gateway, once:\n"
-            f"docker run --rm -it -v {host_dir}:/data/userbot {IMAGE} python spike_echo.py")
+        raise NotReady("this Telegram account has not logged in yet — "
+                       "press Start and enter the code Telegram sends")
 
     client = engine.client()
     # Probe the image BEFORE tearing the old container down. Restarting when the
@@ -237,8 +633,7 @@ def start_container() -> str:
     try:
         client.images.get(IMAGE)
     except docker.errors.ImageNotFound:
-        raise NotReady(f"the {IMAGE} image is not built yet. On the gateway:\n"
-                       f"docker build -f userbot/Dockerfile -t {IMAGE} .") from None
+        raise NotReady(f"the {IMAGE} image is not built yet — press Start to build it") from None
 
     conf = _sync_gateway_url(conf)
     os.makedirs(_dir(), exist_ok=True)

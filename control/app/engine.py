@@ -206,6 +206,25 @@ def tunnel_installed(iid: str) -> bool:
     return st is not None and st.get("state") == "CONNECTED"
 
 
+def rerender(iid: str) -> str:
+    """Rewrite Asterisk configs from the current instance.json and reload PJSIP,
+    without recreating the engine. Used when an external SIP account is added for
+    the userbot while the line is already up."""
+    try:
+        c = client().containers.get(container_name(iid))
+    except docker.errors.NotFound:
+        return "not running"
+    rc1, out1 = c.exec_run(["python3", "/usr/local/bin/render.py"])
+    text1 = out1.decode(errors="replace") if isinstance(out1, bytes) else str(out1)
+    if rc1:
+        return f"render failed: {text1}"
+    rc2, out2 = c.exec_run(["asterisk", "-rx", "pjsip reload"])
+    text2 = out2.decode(errors="replace") if isinstance(out2, bytes) else str(out2)
+    if rc2:
+        return f"pjsip reload failed: {text2}"
+    return "ok"
+
+
 def exec_cli(iid: str, command: str) -> str:
     try:
         c = client().containers.get(container_name(iid))
