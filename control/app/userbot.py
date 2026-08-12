@@ -436,7 +436,8 @@ def start_build() -> dict:
         if st.get("running"):
             return st
         repo = repo_dir()
-        st = {"running": True, "ok": False, "log": f"building {IMAGE} from {repo}\n",
+        st = {"running": True, "ok": False,
+              "log": f"building {IMAGE} from {repo} (docker network=host)\n",
               "started": time.time()}
         _write_build(st)
         _build_thread = threading.Thread(target=_run_build, args=(repo,), daemon=True)
@@ -446,10 +447,16 @@ def start_build() -> dict:
 
 def _run_build(repo: str):
     st = build_status()
+    # A dedicated client: the shared engine client is polled every few seconds
+    # for image_present(), and a 60s default timeout would abort a quiet PJSIP
+    # compile. Host network: docker bridge on this class of host often cannot
+    # reach the internet (apt hangs on deb.debian.org) while the host itself can.
+    build_client = None
     try:
-        gen = engine.client().api.build(
+        build_client = docker.from_env(timeout=None)
+        gen = build_client.api.build(
             path=repo, dockerfile="userbot/Dockerfile", tag=IMAGE,
-            rm=True, decode=True,
+            rm=True, decode=True, network_mode="host",
         )
         for chunk in gen:
             if not isinstance(chunk, dict):
@@ -476,6 +483,12 @@ def _run_build(repo: str):
         st["log"] = (st.get("log") or "") + f"build failed: {e}\n"
         _write_build(st)
         log.warning("userbot image build failed: %s", e)
+    finally:
+        if build_client is not None:
+            try:
+                build_client.close()
+            except Exception:
+                pass
 
 
 # ----------------------------- SIP account -----------------------------
