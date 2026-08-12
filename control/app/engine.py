@@ -35,7 +35,7 @@ _client_lock = threading.Lock()
 _client_cached: "docker.DockerClient | None" = None
 
 
-def _client():
+def client():
     """One shared client. docker.from_env() re-reads the environment, builds a new HTTP
     session over the daemon socket and negotiates an API version on EVERY call — the status
     poller probes each container every few seconds, so paying that repeatedly is a real cost
@@ -72,10 +72,10 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
     cfg.write_instance_json(inst, settings)
     base, host_base = _instance_paths(iid)
     ports = inst.get("ports", {})
-    client = _client()
+    dc = client()
     # remove any existing container
     try:
-        old = client.containers.get(container_name(iid))
+        old = dc.containers.get(container_name(iid))
         old.remove(force=True)
     except docker.errors.NotFound:
         pass
@@ -129,7 +129,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
     for p in range(ports.get("rtp_start", 10000), ports.get("rtp_start", 10000) + 60):
         port_bindings[f"{p}/udp"] = p
 
-    c = client.containers.run(
+    c = dc.containers.run(
         IMAGE,
         name=container_name(iid),
         detach=True,
@@ -147,7 +147,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
 
 def stop(iid: str):
     try:
-        c = _client().containers.get(container_name(iid))
+        c = client().containers.get(container_name(iid))
         c.remove(force=True)
         return True
     except docker.errors.NotFound:
@@ -156,7 +156,7 @@ def stop(iid: str):
 
 def is_running(iid: str) -> bool:
     try:
-        c = _client().containers.get(container_name(iid))
+        c = client().containers.get(container_name(iid))
         return c.status == "running"
     except docker.errors.NotFound:
         return False
@@ -167,7 +167,7 @@ def is_running(iid: str) -> bool:
 
 def container_ip(iid: str) -> str | None:
     try:
-        c = _client().containers.get(container_name(iid))
+        c = client().containers.get(container_name(iid))
         nets = c.attrs["NetworkSettings"]["Networks"]
         for n in nets.values():
             if n.get("IPAddress"):
@@ -208,7 +208,7 @@ def tunnel_installed(iid: str) -> bool:
 
 def exec_cli(iid: str, command: str) -> str:
     try:
-        c = _client().containers.get(container_name(iid))
+        c = client().containers.get(container_name(iid))
         rc, out = c.exec_run(["asterisk", "-rx", command])
         return out.decode(errors="replace") if isinstance(out, bytes) else str(out)
     except Exception as e:  # noqa
@@ -217,7 +217,7 @@ def exec_cli(iid: str, command: str) -> str:
 
 def logs(iid: str, tail: int = 200, since=None) -> str:
     try:
-        c = _client().containers.get(container_name(iid))
+        c = client().containers.get(container_name(iid))
         kwargs = {"tail": tail}
         if since is not None:
             # docker SDK accepts an int (unix ts) or datetime; used by the SMS delivery

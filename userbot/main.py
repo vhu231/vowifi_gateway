@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -59,13 +60,15 @@ def sip_params(cfg: dict) -> tuple[str, int, str]:
     verify = bool(cfg.get("gateway_verify_tls", False))
     line = str(cfg.get("sip_line") or "")
     if not line:
-        instances = requests.get(f"{base}/api/instances", timeout=10,
-                                 verify=verify).json().get("instances", [])
+        r = requests.get(f"{base}/api/instances", timeout=10, verify=verify)
+        r.raise_for_status()
+        instances = r.json().get("instances", [])
         if not instances:
             raise RuntimeError("the gateway has no configured lines")
         line = str(instances[0]["id"])
-    info = requests.get(f"{base}/api/instances/{line}/sipinfo", timeout=10,
-                        verify=verify).json()
+    r = requests.get(f"{base}/api/instances/{line}/sipinfo", timeout=10, verify=verify)
+    r.raise_for_status()
+    info = r.json()
 
     host = info.get("host") or info.get("domain") or "127.0.0.1"
     port = int(info.get("port") or 5060)
@@ -101,6 +104,40 @@ class UserBot:
         self.allow = [str(n).strip() for n in (cfg.get("dial_allowlist") or []) if str(n).strip()]
         self.client = TelegramClient(cfg["session_name"], cfg["api_id"], cfg["api_hash"])
         self.bridge: CallBridge | None = None
+        self.sip: SipLeg | None = None
+        self.last_error = ""
+
+    # ---------- status ----------
+
+    def _status_path(self) -> Path:
+        """Next to the session, i.e. in the directory the control plane shares with
+        us. It reads this file to show the sidecar in the WebUI."""
+        return Path(self.cfg["session_name"]).parent / "status.json"
+
+    async def _report_status(self):
+        """Rewrite status.json on a timer. The control plane treats a stale
+        timestamp as 'not running' — we have no way to announce our own death,
+        so a heartbeat is the signal."""
+        path = self._status_path()
+        while True:
+            try:
+                tg = self.bridge.tg if self.bridge else None
+                payload = {
+                    "ts": int(time.time()),
+                    "telegram_connected": bool(self.client.is_connected()),
+                    "sip_registered": bool(self.sip and self.sip.registered),
+                    "in_call": bool(tg and tg.active),
+                    "owner_id": self.owner,
+                    "sip_user": self.cfg.get("sip_user", ""),
+                    "last_error": self.last_error,
+                }
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(payload), encoding="utf-8")
+                tmp.replace(path)
+            except Exception as e:  # noqa
+                log.debug("status write failed: %s", e)
+            await asyncio.sleep(5)
 
     def _may_dial(self, number: str) -> bool:
         return not self.allow or number in self.allow
@@ -110,21 +147,37 @@ class UserBot:
         me = await self.client.get_me()
         log.info("signed in as %s (id=%s)", me.first_name, me.id)
 
-        host, port, password = sip_params(self.cfg)
-        sip = SipLeg(self.cfg["sip_user"], password, host, port)
-        sip.start()
+        heartbeat = asyncio.create_task(self._report_status())
+        try:
+            # sip_params is blocking HTTP. Run it off the loop so the heartbeat
+            # can actually write last_error / "not yet registered" while we wait.
+            host, port, password = await asyncio.to_thread(sip_params, self.cfg)
+        except Exception as e:  # noqa
+            # Setup mistakes land here: no such external account, the line is stopped,
+            # the line is TLS. Publish them so the WebUI can show what to fix instead
+            # of leaving them in this container's log. The pause is what gives the
+            # heartbeat a turn to write before we exit, and doubles as restart backoff.
+            self.last_error = str(e)
+            log.error("%s", e)
+            await asyncio.sleep(30)
+            heartbeat.cancel()
+            raise
+
+        self.sip = SipLeg(self.cfg["sip_user"], password, host, port)
+        self.sip.start()
 
         loop = asyncio.get_running_loop()
         tg = TelegramCallLeg(self.client, self.owner)
         tg.install(loop)
-        self.bridge = CallBridge(tg, sip, loop)
+        self.bridge = CallBridge(tg, self.sip, loop)
 
         self.client.add_event_handler(self._on_message, events.NewMessage(incoming=True))
         log.info("userbot ready — owner is %s", self.owner)
         try:
             await self.client.run_until_disconnected()
         finally:
-            sip.stop()
+            heartbeat.cancel()
+            self.sip.stop()
 
     async def _on_message(self, event):
         # Only the owner, in their own private chat. Anyone else is ignored

@@ -6,8 +6,25 @@ export default function Settings() {
   const [s, setS] = useState(null)
   const [msg, setMsg] = useState('')
   const [info, setInfo] = useState('')   // '' | 'webhook' | 'telegram' — which help modal is open
+  // The call sidecar lives in its own container and its own config file, so it
+  // loads and saves through a separate endpoint from everything else here.
+  const [ub, setUb] = useState(null)        // the editable form
+  const [ubInfo, setUbInfo] = useState({})  // status + container + signed_in
+  const [ubMsg, setUbMsg] = useState('')
+  const [ubBusy, setUbBusy] = useState(false)
+  const [ubLogs, setUbLogs] = useState(null)
 
   useEffect(() => { api.settings().then(setS).catch(() => {}) }, [])
+  // The sidecar cannot tell us it died; it writes a heartbeat and we poll it.
+  useEffect(() => {
+    const pull = () => api.userbot().then((r) => {
+      setUb((cur) => cur || r.config)     // never clobber a half-typed form
+      setUbInfo(r)
+    }).catch(() => {})                    // transient; the next tick tries again
+    pull()
+    const timer = setInterval(pull, 10000)
+    return () => clearInterval(timer)
+  }, [])
   if (!s) return <div style={{ color: 'var(--text-dim)' }}>Loading…</div>
 
   const upd = (patch) => setS((x) => ({ ...x, ...patch }))
@@ -27,6 +44,45 @@ export default function Settings() {
   const setAllowedChats = (text) => updTgCmd({
     allowed_chats: text.split(',').map((c) => c.trim()).filter(Boolean),
   })
+
+  // Docker's view, which is not the same question as the sidecar's heartbeat: the
+  // container can be up while the process inside it is failing to sign in.
+  const ubBox = ubInfo.container || {}
+  const ubRunning = ubBox.state === 'running'
+  const updUb = (patch) => setUb((x) => ({ ...x, ...patch }))
+  const refreshUb = () => api.userbot().then(setUbInfo).catch(() => {})
+  const saveUb = async () => {
+    try {
+      const r = await api.saveUserbot(ub)
+      setUb(r.config)
+      setUbMsg(r.restart_required
+        ? 'Saved. It is read at startup, so hit Restart to apply it.'
+        : 'Saved.')
+      refreshUb()
+    }
+    catch (e) { setUbMsg('Error: ' + e.message) }
+  }
+  // Start doubles as restart: the server recreates the container either way.
+  const ubAct = async (call, verb) => {
+    setUbBusy(true)
+    setUbMsg(`${verb}…`)
+    try {
+      const r = await call()
+      if (r && r.config) setUb(r.config)
+      setUbMsg(`${verb} done.`)
+      setUbLogs(null)
+    }
+    catch (e) { setUbMsg('Error: ' + e.message) }
+    finally {
+      setUbBusy(false)
+      refreshUb()
+    }
+  }
+  const showUbLogs = async () => {
+    if (ubLogs !== null) { setUbLogs(null); return }
+    try { setUbLogs((await api.userbotLogs()).logs || '(the container has no log yet)') }
+    catch (e) { setUbLogs('Could not read the log: ' + e.message) }
+  }
 
   const save = async () => {
     try {
@@ -272,6 +328,104 @@ export default function Settings() {
         </div>
       </div>
 
+      <div className="card" style={{ padding: 20 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <h3 style={{ marginTop: 0, marginBottom: 0 }}>Telegram calls (userbot)</h3>
+          <UserbotPill info={ubInfo} />
+        </div>
+        <div style={{ fontSize: 13, color: 'var(--text-dim)', margin: '8px 0 12px', lineHeight: 1.55 }}>
+          Bridges Telegram voice calls to this gateway's SIM, so you can dial a real number from
+          Telegram and take incoming calls there. It needs a <b>second Telegram account</b> (a bot
+          token cannot place calls) and runs in its own container, which is why it is configured
+          here but saved and restarted separately.
+        </div>
+        {!ub ? <div style={{ color: 'var(--text-dim)', fontSize: 13 }}>Loading…</div> : <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
+            <div><label>API ID</label>
+              <input className="mono" type="number" value={ub.api_id || ''}
+                onChange={(e) => updUb({ api_id: e.target.value })} placeholder="from my.telegram.org" /></div>
+            {/* Same write-only rule as the bot token: this credential owns a whole account. */}
+            <div><label>API hash{ub.api_hash_set ? ' (saved)' : ''}</label>
+              <input className="mono" type="password" value={ub.api_hash || ''}
+                onChange={(e) => updUb({ api_hash: e.target.value })}
+                placeholder={ub.api_hash_set ? 'leave blank to keep' : 'from my.telegram.org'} /></div>
+            <div><label>Account phone number</label>
+              <input className="mono" value={ub.phone || ''}
+                onChange={(e) => updUb({ phone: e.target.value })} placeholder="+8613800138000" /></div>
+            <div><label>Your Telegram user ID</label>
+              <input className="mono" type="number" value={ub.owner_id || ''}
+                onChange={(e) => updUb({ owner_id: e.target.value })} placeholder="ask @userinfobot" /></div>
+          </div>
+          <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginTop: 6, lineHeight: 1.5 }}>
+            Only that user ID can dial or be bridged — the account will happily accept calls from
+            anyone otherwise.
+          </div>
+
+          <h4 style={{ marginBottom: 4 }}>SIP leg</h4>
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
+            <div><label>External account username</label>
+              <input className="mono" value={ub.sip_user || ''}
+                onChange={(e) => updUb({ sip_user: e.target.value })} placeholder="tgbridge" /></div>
+            <div><label>Password{ub.sip_password_set ? ' (saved)' : ''}</label>
+              <input className="mono" type="password" value={ub.sip_password || ''}
+                onChange={(e) => updUb({ sip_password: e.target.value })}
+                placeholder="blank = read it from the line" /></div>
+          </div>
+          <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginTop: 6, lineHeight: 1.5 }}>
+            Add an external account with this username on the line you want to use (Lines → SIP
+            accounts). Left blank, the password is read from that account automatically.
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <label>Line id</label>
+            <input className="mono" value={ub.sip_line || ''}
+              onChange={(e) => updUb({ sip_line: e.target.value })} placeholder="blank = first configured line" />
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <label>Numbers it may dial (comma separated)</label>
+            {/* Kept as raw text while typing — splitting on every keystroke would eat the
+                comma you just typed. The server splits it on save. */}
+            <input className="mono"
+              value={Array.isArray(ub.dial_allowlist) ? ub.dial_allowlist.join(', ') : (ub.dial_allowlist || '')}
+              onChange={(e) => updUb({ dial_allowlist: e.target.value })}
+              placeholder="empty = any number" />
+          </div>
+
+          <div style={{ marginTop: 14, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <button className="btn" onClick={saveUb} disabled={ubBusy}>Save</button>
+            <button className="btn" disabled={ubBusy}
+              onClick={() => ubAct(() => api.userbotStart(ub), ubRunning ? 'Restarting' : 'Starting')}>
+              {ubRunning ? 'Restart' : 'Start'}
+            </button>
+            {ubBox.exists &&
+              <button className="btn btn-ghost" disabled={ubBusy}
+                onClick={() => ubAct(api.userbotStop, 'Stopping')}>Stop</button>}
+            <button className="btn btn-ghost" onClick={showUbLogs}>
+              {ubLogs === null ? 'Log' : 'Hide log'}
+            </button>
+          </div>
+          {ubMsg && <div style={{
+            marginTop: 8, fontSize: 12.5, whiteSpace: 'pre-wrap', lineHeight: 1.6,
+            color: ubMsg.startsWith('Error') ? '#ef4444' : '#22c55e',
+          }}>{ubMsg}</div>}
+          {ubLogs !== null &&
+            <pre className="mono" style={{
+              marginTop: 10, maxHeight: 260, overflow: 'auto', fontSize: 11.5, lineHeight: 1.5,
+              background: 'var(--bg-deep, #0b0f16)', padding: 10, borderRadius: 6,
+              whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+            }}>{ubLogs}</pre>}
+          {!ubInfo.signed_in &&
+            <div style={{ fontSize: 11.5, color: '#f59e0b', marginTop: 10, lineHeight: 1.6 }}>
+              This account has not logged in to Telegram yet. The code arrives by SMS and has to be
+              typed at a terminal on the gateway, once — Start will refuse until then and show the
+              exact command.
+            </div>}
+          <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginTop: 10, lineHeight: 1.6 }}>
+            Restart recreates the container, so it also applies whatever you just saved. The image
+            has to exist first: <code>docker build -f userbot/Dockerfile -t vowifi/userbot .</code>
+          </div>
+        </>}
+      </div>
+
       <div>
         <button className="btn btn-primary" onClick={save}>Save settings</button>
         {msg && <span style={{ marginLeft: 12, color: '#22c55e', fontSize: 13 }}>{msg}</span>}
@@ -279,4 +433,40 @@ export default function Settings() {
       {info && <PushInfoModal channel={info} onClose={() => setInfo('')} />}
     </div>
   )
+}
+
+/** Two sources, deliberately kept apart. Docker says whether the container is up;
+ *  the heartbeat says whether the process inside it is actually working. A container
+ *  that is running while the heartbeat is stale is the interesting case — it is what
+ *  a crash loop or a failed sign-in looks like — so it gets its own wording. */
+function UserbotPill({ info }) {
+  const st = info.status || {}
+  const box = info.container || {}
+  const pill = (text, colour) => (
+    <span style={{
+      fontSize: 11.5, padding: '2px 9px', borderRadius: 20, whiteSpace: 'nowrap',
+      border: `1px solid ${colour}55`, color: colour, background: `${colour}18`,
+    }}>{text}</span>
+  )
+  const note = (text, colour = 'var(--text-mute)') =>
+    <span style={{ fontSize: 11.5, color: colour }}>{text}</span>
+  const Row = ({ children }) =>
+    <span style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>{children}</span>
+
+  if (!box.exists) return <Row>{pill('Not created', '#94a3b8')}{note('press Start')}</Row>
+  if (box.state !== 'running') return <Row>{pill(box.state || 'stopped', '#94a3b8')}</Row>
+  if (!st.running) {
+    return <Row>
+      {pill('Container up, not responding', '#ef4444')}
+      {note(st.last_error || 'it is probably failing at startup — check the log', '#ef4444')}
+    </Row>
+  }
+  return <Row>
+    {st.in_call ? pill('In a call', '#f59e0b') : pill('Running', '#22c55e')}
+    {pill(st.telegram_connected ? 'Telegram up' : 'Telegram down',
+      st.telegram_connected ? '#22c55e' : '#ef4444')}
+    {pill(st.sip_registered ? 'SIP registered' : 'SIP down',
+      st.sip_registered ? '#22c55e' : '#ef4444')}
+    {st.last_error ? note(st.last_error, '#ef4444') : null}
+  </Row>
 }

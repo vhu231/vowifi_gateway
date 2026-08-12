@@ -107,6 +107,7 @@ class _Account(pj.Account):
 
     def onRegState(self, prm):                               # noqa: ARG002
         info = self.getInfo()
+        self._leg.registered = bool(info.regIsActive)
         log.info("SIP registration: %s (%s)",
                  "up" if info.regIsActive else "down", info.regStatus)
 
@@ -126,6 +127,7 @@ class SipLeg:
 
     def __init__(self, user: str, password: str, domain: str, port: int = 5060):
         self.user, self.password, self.domain, self.port = user, password, domain, port
+        self.registered = False
         self.on_pcm = None
         self.on_incoming = None
         self.on_connected = None

@@ -57,6 +57,14 @@ export const api = {
   settings: () => j('GET', '/api/settings'),
   saveSettings: (patch) => j('PUT', '/api/settings', patch),
 
+  // The call sidecar is a separate container; these read and write the config
+  // file the two share through the data dir, plus its heartbeat.
+  userbot: () => j('GET', '/api/userbot'),
+  saveUserbot: (patch) => j('PUT', '/api/userbot', patch),
+  userbotStart: (patch) => j('POST', '/api/userbot/start', patch || {}),
+  userbotStop: () => j('POST', '/api/userbot/stop'),
+  userbotLogs: (tail = 200) => j('GET', `/api/userbot/logs?tail=${tail}`),
+
   instances: () => j('GET', '/api/instances'),
   cards: () => j('GET', '/api/cards'),
   portsSuggest: () => j('GET', '/api/ports/suggest'),

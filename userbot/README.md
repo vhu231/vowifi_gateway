@@ -28,6 +28,14 @@ cp config.example.json config.json       # api_id, api_hash, phone, owner_id
 python spike_echo.py
 ```
 
+If the config was saved from **Settings → Telegram calls**, it already lives on
+the data volume. Login with that file instead of a local copy:
+
+```bash
+docker run --rm -it -v /path/to/data/userbot:/data/userbot \
+  vowifi/userbot python spike_echo.py
+```
+
 Get `api_id` / `api_hash` from <https://my.telegram.org/apps> and your numeric
 `owner_id` from [@userinfobot](https://t.me/userinfobot). The first run asks for
 the login code Telegram sends you; after that the session is cached.
@@ -68,16 +76,36 @@ Nothing in the engine image changes: the inbound dialplan already rings every
 external account, and an INVITE from one lands in `from-local`, which hairpins
 it to the IMS trunk.
 
+Build the image once. This compiles PJSIP, which takes a while on a Pi:
+
 ```bash
 docker build -f userbot/Dockerfile -t vowifi/userbot .
+```
+
+From there, **Settings → Telegram calls (userbot)** in the WebUI runs the thing:
+the same fields as `config.json`, Start / Restart / Stop, the container's log, and
+what the sidecar last reported — Telegram connected, SIP registered, in a call, or
+a startup error such as a missing external account.
+
+Both directions are plain files on the shared volume; the control plane never
+talks to this container, it only asks Docker to run it. Config is read once at
+startup, so Restart is what applies a change. Restart recreates the container,
+which costs nothing: the session and the config live on the volume, not in it.
+
+**Start refuses to run a container that has never signed in.** Telethon asks for
+the login code on stdin and a detached container has no stdin, so it would
+crash-loop rather than prompt. Do step 0 first.
+
+By hand, if you would rather:
+
+```bash
 docker run -d --name vowifi-userbot --network host \
   -v /path/to/data/userbot:/data/userbot \
   vowifi/userbot
 ```
 
 Host networking is the simple option because the SIP leg needs to reach the
-engine's SIP port and receive RTP. The first build compiles PJSIP, which takes a
-while on a Pi.
+engine's SIP port and receive RTP.
 
 Then, in order: registration comes up (`SIP registration: up` in the log),
 `/call <number>` places a call, an inbound call to the SIM rings Telegram, and

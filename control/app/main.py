@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
 from . import store, engine, status as status_mod, sim, card, notify_push, lpa, estkme, usbreader
-from . import telegram_bot
+from . import telegram_bot, userbot
 from .ami import AmiClient
 
 logging.basicConfig(level=logging.INFO,
@@ -1273,6 +1273,63 @@ def api_put_settings(body: dict):
             400,
             detail={"code": "invalid_settings", "message": str(e)},
         ) from e
+
+
+# ----------------------------- userbot sidecar -----------------------------
+# These are sync handlers on purpose: every one of them is blocking file or Docker
+# I/O, and FastAPI runs a non-async endpoint in a worker thread, off the loop.
+@app.get("/api/userbot")
+def api_userbot():
+    """Config, what the sidecar last reported, and what Docker thinks of its
+    container. The two processes only meet through the shared data dir."""
+    return {"config": userbot.public(), "status": userbot.status(),
+            "container": userbot.container(), "signed_in": userbot.signed_in()}
+
+
+@app.put("/api/userbot")
+def api_userbot_save(body: dict):
+    try:
+        saved = userbot.update(body)
+    except ValueError as e:
+        raise HTTPException(400, detail={"code": "invalid_userbot_config",
+                                         "message": str(e)}) from e
+    # The sidecar reads its config once, at startup.
+    return {"config": saved, "restart_required": userbot.container().get("state") == "running"}
+
+
+@app.post("/api/userbot/start")
+def api_userbot_start(body: dict | None = None):
+    """Also the restart button: starting recreates the container, so a config
+    change and a plain restart are the same operation. The optional body is the
+    form from the WebUI — Start used to read the file on disk and ignore whatever
+    the user had just typed."""
+    if body:
+        try:
+            userbot.update(body)
+        except ValueError as e:
+            raise HTTPException(400, detail={"code": "invalid_userbot_config",
+                                             "message": str(e)}) from e
+    try:
+        userbot.start_container()
+    except userbot.NotReady as e:
+        raise HTTPException(409, detail={"code": "userbot_not_ready",
+                                         "message": str(e)}) from e
+    except Exception as e:  # noqa
+        raise HTTPException(500, detail={"code": "userbot_start_failed",
+                                         "message": str(e)}) from e
+    return {"ok": True, "container": userbot.container(), "config": userbot.public()}
+
+
+@app.post("/api/userbot/stop")
+def api_userbot_stop():
+    return {"ok": userbot.stop_container(), "container": userbot.container()}
+
+
+@app.get("/api/userbot/logs")
+def api_userbot_logs(tail: int = 200):
+    """The sidecar's own log. Worth having in the WebUI: a sign-in or ntgcalls
+    failure never reaches status.json because the process dies before writing it."""
+    return {"logs": userbot.logs(tail)}
 
 
 # ----------------------------- instances -----------------------------

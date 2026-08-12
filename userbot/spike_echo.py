@@ -44,12 +44,15 @@ log = logging.getLogger("spike")
 
 def load_config() -> dict:
     import json
-    path = Path(__file__).parent / "config.json"
-    if not path.exists():
-        log.error("config.json missing — copy config.example.json and fill it in")
-        sys.exit(1)
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    # Same search as main.py: a local file for a laptop spike, then the volume
+    # the WebUI writes. The login command the Settings page prints is the second
+    # path, and looking only next to this script made that command fail.
+    for path in (Path(__file__).parent / "config.json", Path("/data/userbot/config.json")):
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+    log.error("config.json missing — copy config.example.json, or save the form in Settings")
+    sys.exit(1)
 
 
 class EchoProbe:
