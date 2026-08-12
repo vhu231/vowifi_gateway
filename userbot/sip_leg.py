@@ -257,8 +257,13 @@ class SipLeg:
             raise RuntimeError("a SIP call is already in progress")
         self._call = _Call(self._acc, self)
         prm = pj.CallOpParam(True)
-        self._call.makeCall(f"sip:{number}@{self.domain}", prm)
-        log.info("SIP INVITE to %s", number)
+        # The port is not optional here. Every line's Asterisk is on its own
+        # host port (5060, 5070, ...), and PJSIP routes an INVITE by its request
+        # URI: without one this dials whichever engine holds the default 5060,
+        # which then rejects an account it has never heard of.
+        target = f"sip:{number}@{self.domain}:{self.port}"
+        self._call.makeCall(target, prm)
+        log.info("SIP INVITE to %s", target)
 
     def _on_incoming(self, call_id):
         if self._call:
