@@ -62,7 +62,7 @@ body {
 }
 
 /* status dot colors (semantic — consistent across themes) */
-.dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
+.dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; flex-shrink: 0; }
 .st-OK { background: #22c55e; box-shadow: 0 0 8px #22c55e88; }
 .st-REGISTERING { background: #eab308; box-shadow: 0 0 8px #eab30888; }
 .st-TUNNEL_DOWN { background: #f97316; }
