@@ -1252,6 +1252,7 @@ async def api_provision(body: dict):
             "duplicate_iccid" if "ICCID" in message
             else "duplicate_sip_username"
             if "more than once" in message or "reserved" in message
+            or "already belongs to line" in message
             else "invalid_sip_account"
         )
         raise HTTPException(
@@ -1393,6 +1394,7 @@ async def api_instance_upsert(body: dict):
             "duplicate_iccid" if "ICCID" in message
             else "duplicate_sip_username"
             if "more than once" in message or "reserved" in message
+            or "already belongs to line" in message
             else "invalid_sip_account"
         )
         raise HTTPException(

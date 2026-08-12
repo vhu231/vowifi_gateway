@@ -100,6 +100,61 @@ class _Call(pj.Call):
         log.info("DTMF from the far end: %s", prm.digit)
 
 
+_endpoint: "pj.Endpoint | None" = None
+_endpoint_lock = threading.Lock()
+
+
+def shared_endpoint() -> "pj.Endpoint":
+    """The one PJSUA2 endpoint this process gets.
+
+    PJSUA2 is a singleton: a second libCreate() raises PJ_EEXISTS, and because
+    that surfaces as a C++ exception it takes the interpreter with it rather
+    than raising in Python. Every card's account therefore shares this endpoint
+    and its UDP transport, which is also why their usernames have to differ --
+    an account is matched by its `sip:user@host` identity.
+    """
+    global _endpoint
+    with _endpoint_lock:
+        if _endpoint is not None:
+            return _endpoint
+        ep = pj.Endpoint()
+        ep.libCreate()
+
+        cfg = pj.EpConfig()
+        # The whole point: give PJSIP a 48 kHz clock and it resamples to the
+        # negotiated wire codec itself, so our frames match Telegram exactly.
+        cfg.medConfig.clockRate = SAMPLE_RATE
+        cfg.medConfig.sndClockRate = SAMPLE_RATE
+        cfg.medConfig.channelCount = CHANNELS
+        cfg.medConfig.audioFramePtime = 10
+        cfg.uaConfig.userAgent = "vowifi-userbot"
+        cfg.logConfig.level = 3
+        ep.libInit(cfg)
+
+        transport = pj.TransportConfig()
+        transport.port = 0                      # any free local port
+        ep.transportCreate(pj.PJSIP_TRANSPORT_UDP, transport)
+        ep.libStart()
+        # No sound card in a container, and we do not want one: audio only ever
+        # travels between our bridge ports and the calls.
+        ep.audDevManager().setNullDev()
+        _endpoint = ep
+        return ep
+
+
+def shutdown_endpoint():
+    """Tear the whole stack down, once every leg has stopped."""
+    global _endpoint
+    with _endpoint_lock:
+        if _endpoint is None:
+            return
+        try:
+            _endpoint.libDestroy()
+        except Exception as e:  # noqa
+            log.debug("SIP endpoint shutdown: %s", e)
+        _endpoint = None
+
+
 class _Account(pj.Account):
     def __init__(self, leg):
         super().__init__()
@@ -142,27 +197,7 @@ class SipLeg:
     # ---------- lifecycle ----------
 
     def start(self):
-        self._ep = pj.Endpoint()
-        self._ep.libCreate()
-
-        cfg = pj.EpConfig()
-        # The whole point: give PJSIP a 48 kHz clock and it resamples to the
-        # negotiated wire codec itself, so our frames match Telegram exactly.
-        cfg.medConfig.clockRate = SAMPLE_RATE
-        cfg.medConfig.sndClockRate = SAMPLE_RATE
-        cfg.medConfig.channelCount = CHANNELS
-        cfg.medConfig.audioFramePtime = 10
-        cfg.uaConfig.userAgent = "vowifi-userbot"
-        cfg.logConfig.level = 3
-        self._ep.libInit(cfg)
-
-        transport = pj.TransportConfig()
-        transport.port = 0                      # any free local port
-        self._ep.transportCreate(pj.PJSIP_TRANSPORT_UDP, transport)
-        self._ep.libStart()
-        # No sound card in a container, and we do not want one: audio only ever
-        # travels between our bridge port and the call.
-        self._ep.audDevManager().setNullDev()
+        self._ep = shared_endpoint()
 
         acfg = pj.AccountConfig()
         acfg.idUri = f"sip:{self.user}@{self.domain}"
@@ -174,11 +209,13 @@ class SipLeg:
         log.info("SIP account %s@%s registering", self.user, self.domain)
 
     def stop(self):
+        """Drop this card's account. The endpoint is shared, so it outlives us —
+        see shutdown_endpoint()."""
         try:
             if self._call:
                 self.hangup()
-            if self._ep:
-                self._ep.libDestroy()
+            if self._acc:
+                self._acc.shutdown()
         except Exception as e:  # noqa
             log.debug("SIP shutdown: %s", e)
         self._ep = self._acc = self._call = None

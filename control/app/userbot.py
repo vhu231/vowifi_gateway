@@ -73,6 +73,8 @@ BUILD_LOG_LIMIT = 200_000
 _build_lock = threading.Lock()
 _build_thread: threading.Thread | None = None
 
+SIP_USER_DEFAULT = "tgbridge"
+
 DEFAULTS = {
     "api_id": 0,
     "api_hash": "",
@@ -80,13 +82,25 @@ DEFAULTS = {
     # Inside the container. Telethon appends .session; the file grants full
     # control of the account, which is why it lives on the mounted volume.
     "session_name": "/data/userbot/userbot",
+    # The primary account: the one a card answers for unless told otherwise,
+    # and the identity the sidecar refuses to start without.
     "owner_id": 0,
+    # Everyone ELSE allowed to drive it, primary excluded. Permissions are flat:
+    # any of these may dial on any card.
+    "owner_ids": [],
     "gateway_url": "https://127.0.0.1:8443",
     "gateway_verify_tls": False,
-    "sip_user": "tgbridge",
-    "sip_password": "",     # blank = take it from the line's external account
-    "sip_line": "",         # blank = the first configured line
+    # One entry per SIM the sidecar answers for:
+    #   {"line": "1", "sip_user": "tgbridge", "answer_owner": 0}
+    # answer_owner 0 means the primary account. A blank line resolves to the
+    # first configured one on the next Start.
+    "cards": [],
     "dial_allowlist": [],
+    # Single-card keys from before multi-card. Read for migration and still
+    # honoured in a hand-written config.json; never written back.
+    "sip_user": "",
+    "sip_password": "",     # blank = take it from the line's external account
+    "sip_line": "",
 }
 
 
@@ -116,6 +130,55 @@ def _host_session() -> str:
     return os.path.join(_dir(), "userbot")
 
 
+def _int_or_zero(value) -> int:
+    try:
+        return int(str(value).strip() or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_cards(conf: dict) -> list[dict]:
+    """The configured cards, cleaned up and de-duplicated by line.
+
+    A config written before multi-card carried one sip_line/sip_user pair
+    instead. Folding that into a single card keeps the username Asterisk
+    already has an endpoint for — renaming it would break a working line.
+    """
+    cards: list[dict] = []
+    seen: set[str] = set()
+    for raw in (conf.get("cards") or []):
+        if not isinstance(raw, dict):
+            continue
+        line = str(raw.get("line") or "").strip()
+        if line in seen:
+            continue
+        seen.add(line)
+        cards.append({
+            "line": line,
+            "sip_user": str(raw.get("sip_user") or "").strip(),
+            "answer_owner": _int_or_zero(raw.get("answer_owner")),
+        })
+    if cards:
+        return cards
+    legacy_line = str(conf.get("sip_line") or "").strip()
+    legacy_user = str(conf.get("sip_user") or "").strip()
+    if legacy_line or legacy_user:
+        return [{"line": legacy_line,
+                 "sip_user": legacy_user or SIP_USER_DEFAULT,
+                 "answer_owner": 0}]
+    return []
+
+
+def authorized_ids(conf: dict) -> list[int]:
+    """Every Telegram account allowed to drive the sidecar, primary first."""
+    out: list[int] = []
+    for raw in [conf.get("owner_id")] + list(conf.get("owner_ids") or []):
+        uid = _int_or_zero(raw)
+        if uid and uid not in out:
+            out.append(uid)
+    return out
+
+
 def load() -> dict:
     out = dict(DEFAULTS)
     try:
@@ -126,6 +189,9 @@ def load() -> dict:
         pass
     except Exception as e:  # noqa
         log.warning("unreadable userbot config: %r", e)
+    # Present one shape to every caller, whatever the file happens to hold.
+    out["cards"] = normalize_cards(out)
+    out["owner_ids"] = [uid for uid in authorized_ids(out)[1:]]
     return out
 
 
@@ -142,6 +208,65 @@ def public() -> dict:
     return out
 
 
+def _clean_ids(raw) -> list[int]:
+    """A comma-separated string or a list, either way a list of user ids."""
+    if isinstance(raw, str):
+        raw = raw.replace(";", ",").split(",")
+    out: list[int] = []
+    for item in (raw or []):
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            uid = int(text)
+        except ValueError:
+            raise ValueError(f"{text!r} is not a Telegram user ID — those are numbers "
+                             "(ask @userinfobot)") from None
+        if uid and uid not in out:
+            out.append(uid)
+    return out
+
+
+def _clean_cards(raw, owners: list[int]) -> list[dict]:
+    """Validate the card list the WebUI sent.
+
+    SIP usernames have to be unique across every line, not just within one: the
+    sidecar holds all of them in a single PJSUA2 endpoint, where two accounts
+    sharing a `sip:user@host` identity make an inbound call ambiguous.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("cards must be a list")
+    cards: list[dict] = []
+    lines_seen: set[str] = set()
+    users_seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        line = str(item.get("line") or "").strip()
+        user = str(item.get("sip_user") or "").strip()
+        owner = _int_or_zero(item.get("answer_owner"))
+        if line and not cfg.get_instance(line):
+            raise ValueError(f"there is no line {line}")
+        if line in lines_seen:
+            raise ValueError(f"line {line or '(first configured)'} is listed twice — "
+                             "one card per line")
+        lines_seen.add(line)
+        if user:
+            cfg.validate_sip_username(user)
+            if user in users_seen:
+                raise ValueError(f"two cards both use the SIP username {user!r} — "
+                                 "each line needs its own")
+            users_seen.add(user)
+            clash = cfg.sip_username_line(user, exclude_iid=line)
+            if clash:
+                raise ValueError(f"SIP username {user!r} already belongs to line {clash} — "
+                                 "each line needs its own")
+        if owner and owner not in owners:
+            raise ValueError(f"{owner} answers a card but is not an authorised account")
+        cards.append({"line": line, "sip_user": user, "answer_owner": owner})
+    return cards
+
+
 def update(patch: dict) -> dict:
     current = load()
     patch = {k: v for k, v in (patch or {}).items()
@@ -156,6 +281,8 @@ def update(patch: dict) -> dict:
                 patch[key] = int(str(patch[key]).strip() or 0)
             except ValueError:
                 raise ValueError(f"{key} must be a number")
+    if "owner_ids" in patch:
+        patch["owner_ids"] = _clean_ids(patch["owner_ids"])
     if "dial_allowlist" in patch:
         raw = patch["dial_allowlist"]
         if isinstance(raw, str):
@@ -163,6 +290,15 @@ def update(patch: dict) -> dict:
         patch["dial_allowlist"] = [str(n).strip() for n in (raw or []) if str(n).strip()]
 
     merged = {**current, **patch}
+    # The primary is never also an extra, and a card may only be answered by an
+    # account that still exists after this save.
+    merged["owner_ids"] = authorized_ids(merged)[1:]
+    merged["cards"] = (_clean_cards(patch["cards"], authorized_ids(merged))
+                       if "cards" in patch else normalize_cards(merged))
+    if merged["cards"]:
+        # Folded into cards; leaving them behind is a second source of truth.
+        merged["sip_line"] = ""
+        merged["sip_user"] = ""
     os.makedirs(_dir(), exist_ok=True)
     tmp = config_path() + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -539,50 +675,82 @@ def _require_start_fields(conf: dict):
         raise NotReady("the account phone number must be in international form, starting with +")
 
 
-def ensure_sip_account(conf: dict) -> str | None:
-    """Create the external SIP account on the target line if it is missing.
-    A running engine is re-rendered and PJSIP reloaded so the userbot can
-    register without a full line restart."""
-    user = str(conf.get("sip_user") or "tgbridge").strip()
-    if not user:
-        raise NotReady("the SIP username is empty")
+def _derive_sip_user(iid: str, taken: set[str]) -> str:
+    """A username no other line is using. The first card keeps the historical
+    plain `tgbridge` so an install that already works is not renamed out from
+    under a live Asterisk endpoint."""
+    for candidate in [SIP_USER_DEFAULT, f"{SIP_USER_DEFAULT}{iid}"]:
+        if candidate not in taken and not cfg.sip_username_line(candidate, exclude_iid=iid):
+            return candidate
+    suffix = 2
+    while True:
+        candidate = f"{SIP_USER_DEFAULT}{iid}-{suffix}"
+        if candidate not in taken and not cfg.sip_username_line(candidate, exclude_iid=iid):
+            return candidate
+        suffix += 1
+
+
+def ensure_sip_accounts(conf: dict) -> list[str]:
+    """Give every configured card a SIP account on its line, creating what is
+    missing. A running engine is re-rendered and PJSIP reloaded so the sidecar
+    can register without a full line restart.
+
+    Returns one note per card that needed saying; the WebUI shows them.
+    """
     instances = cfg.list_instances()
     if not instances:
         raise NotReady("no SIM line is configured yet — add one under SIM Config first")
-    wanted = str(conf.get("sip_line") or "").strip()
-    inst = cfg.get_instance(wanted) if wanted else instances[0]
-    if not inst:
-        raise NotReady(f"no line {wanted}")
-    iid = str(inst["id"])
-    if not wanted:
-        update({"sip_line": iid})
-        conf["sip_line"] = iid
-    sip = dict(inst.get("sip") or {})
-    external = [a for a in (sip.get("external") or []) if isinstance(a, dict)]
-    created = False
-    if not any(str(a.get("username") or "").strip() == user for a in external):
-        password = str(conf.get("sip_password") or "").strip() or secrets.token_urlsafe(12)
-        external.append({"username": user, "password": password})
-        try:
-            inst = cfg.upsert_instance({"id": iid, "sip": {**sip, "external": external}})
-        except ValueError as e:
-            raise NotReady(str(e)) from e
-        created = True
-    # Account may already be in config.yaml from an earlier Start that never
-    # reached a live Asterisk reload. Always re-render a running engine.
-    if engine.is_running(iid):
-        settings = (cfg.load() or {}).get("settings") or {}
-        cfg.write_instance_json(inst, settings)
-        result = engine.rerender(iid)
-        if result != "ok":
-            log.warning("userbot: SIP account %s on line %s reload said %s",
-                        user, iid, result)
-            return (f"{'created' if created else 'found'} SIP account {user} on line {iid}, "
-                    f"but the running engine did not reload ({result}) — Stop → Start that line")
-    if created:
-        log.info("created external SIP account %s on line %s", user, iid)
-        return f"created SIP account {user} on line {iid}"
-    return None
+    cards = normalize_cards(conf)
+    if not cards:
+        cards = [{"line": "", "sip_user": "", "answer_owner": 0}]
+
+    notes: list[str] = []
+    resolved: list[dict] = []
+    taken = {c["sip_user"] for c in cards if c.get("sip_user")}
+    for card in cards:
+        wanted = str(card.get("line") or "").strip()
+        inst = cfg.get_instance(wanted) if wanted else instances[0]
+        if not inst:
+            raise NotReady(f"no line {wanted}")
+        iid = str(inst["id"])
+        user = str(card.get("sip_user") or "").strip() or _derive_sip_user(iid, taken)
+        taken.add(user)
+        resolved.append({**card, "line": iid, "sip_user": user})
+
+        sip = dict(inst.get("sip") or {})
+        external = [a for a in (sip.get("external") or []) if isinstance(a, dict)]
+        created = False
+        if not any(str(a.get("username") or "").strip() == user for a in external):
+            password = str(card.get("sip_password") or "").strip() or secrets.token_urlsafe(12)
+            external.append({"username": user, "password": password})
+            try:
+                inst = cfg.upsert_instance({"id": iid, "sip": {**sip, "external": external}})
+            except ValueError as e:
+                raise NotReady(str(e)) from e
+            created = True
+        # The account may already be in config.yaml from an earlier Start that
+        # never reached a live Asterisk reload. Always re-render a running engine.
+        if engine.is_running(iid):
+            settings = (cfg.load() or {}).get("settings") or {}
+            cfg.write_instance_json(inst, settings)
+            result = engine.rerender(iid, expect_user=user)
+            if result != "ok":
+                log.warning("userbot: SIP account %s on line %s reload said %s",
+                            user, iid, result)
+                notes.append(f"{'created' if created else 'found'} SIP account {user} on "
+                             f"line {iid}, but the running engine did not reload ({result}) "
+                             f"— Stop → Start that line")
+                continue
+        if created:
+            log.info("created external SIP account %s on line %s", user, iid)
+            notes.append(f"created SIP account {user} on line {iid}")
+
+    # Persist whatever we had to fill in (a blank line, a derived username) so
+    # the sidecar reads the same cards the engines were just configured for.
+    if resolved != cards:
+        update({"cards": resolved})
+        conf["cards"] = resolved
+    return notes
 
 
 def prepare_and_start(body: dict | None = None) -> dict:
@@ -598,10 +766,7 @@ def prepare_and_start(body: dict | None = None) -> dict:
             raise NotReady(str(e)) from e
     conf = load()
     _require_start_fields(conf)
-    notes: list[str] = []
-    sip_note = ensure_sip_account(conf)
-    if sip_note:
-        notes.append(sip_note)
+    notes = ensure_sip_accounts(conf)
 
     if not image_present():
         start_build()

@@ -103,6 +103,17 @@ export default function Settings({ instances = [] }) {
     ubRef.current = next
     return next
   })
+  const ubCards = (ub && Array.isArray(ub.cards) ? ub.cards : [])
+  const updCard = (index, patch) => updUb({
+    cards: ubCards.map((c, i) => (i === index ? { ...c, ...patch } : c)),
+  })
+  // Every account that may drive the sidecar, primary first. Also the choices
+  // for "who answers this card".
+  const ubOwners = [Number(ub && ub.owner_id) || 0]
+    .concat(String((ub && ub.owner_ids) || '').split(',').map((x) => Number(x.trim()) || 0))
+    .filter((x, i, all) => x && all.indexOf(x) === i)
+  const dupCardUser = ubCards.find((c, i) => c.sip_user
+    && ubCards.findIndex((o) => o.sip_user === c.sip_user) !== i)
   const refreshUb = () => api.userbot().then(setUbInfo).catch(() => {})
   const saveUb = async () => {
     try {
@@ -395,10 +406,10 @@ export default function Settings({ instances = [] }) {
           <UserbotPill info={ubInfo} />
         </div>
         <div style={{ fontSize: 13, color: 'var(--text-dim)', margin: '8px 0 12px', lineHeight: 1.55 }}>
-          Bridges Telegram voice calls to this gateway's SIM. It needs a <b>second Telegram
+          Bridges Telegram voice calls to this gateway's SIMs. It needs a <b>second Telegram
           account</b> (a bot token cannot place calls). Fill the fields and press Start — the
-          image is built if missing, a SIP account is created on the line if missing, and the
-          login code Telegram sends is entered here. Call path still untested on real hardware.
+          image is built if missing, each card's SIP account is created if missing, and the
+          login code Telegram sends is entered here.
         </div>
         {!ub ? <div style={{ color: 'var(--text-dim)', fontSize: 13 }}>Loading…</div> : <>
           <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
@@ -417,43 +428,70 @@ export default function Settings({ instances = [] }) {
               <input className="mono" type="number" value={ub.owner_id || ''}
                 onChange={(e) => updUb({ owner_id: e.target.value })} placeholder="ask @userinfobot" /></div>
           </div>
+          <div style={{ marginTop: 10 }}>
+            <label>Other Telegram user IDs allowed to use it (comma separated)</label>
+            <input className="mono"
+              value={Array.isArray(ub.owner_ids) ? ub.owner_ids.join(', ') : (ub.owner_ids || '')}
+              onChange={(e) => updUb({ owner_ids: e.target.value })}
+              placeholder="empty = only you" />
+          </div>
           <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginTop: 6, lineHeight: 1.5 }}>
-            Only that user ID can dial or be bridged — the account will happily accept calls from
-            anyone otherwise.
+            Everyone listed may dial on any card, and a call from any of them is answered — the
+            account would otherwise accept calls from strangers. Only one call runs at a time.
           </div>
 
-          <h4 style={{ marginBottom: 4 }}>SIP leg</h4>
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
-            <div><label>External account username</label>
-              <input className="mono" value={ub.sip_user || ''}
-                onChange={(e) => updUb({ sip_user: e.target.value })} placeholder="tgbridge" /></div>
-            <div><label>Password{ub.sip_password_set ? ' (saved)' : ''}</label>
-              <input className="mono" type="password" value={ub.sip_password || ''}
-                onChange={(e) => updUb({ sip_password: e.target.value })}
-                placeholder="blank = read it from the line" /></div>
+          <h4 style={{ marginBottom: 4 }}>SIM cards</h4>
+          <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginBottom: 8, lineHeight: 1.5 }}>
+            One row per SIM. Start creates each SIP account on its line if it is missing, and the
+            sidecar reads the password back from the gateway. Usernames must differ between lines:
+            the sidecar registers them all from one SIP stack, where two identical names make an
+            incoming call ambiguous.
           </div>
-          <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginTop: 6, lineHeight: 1.5 }}>
-            Leave the password blank. Start creates <code>{ub.sip_user || 'tgbridge'}</code> on the
-            line below if that account is missing, and the sidecar reads the password from the line.
-          </div>
-          <div style={{ marginTop: 10 }}>
-            <label>Line</label>
-            <select className="mono" value={ub.sip_line || ''}
-              onChange={(e) => updUb({ sip_line: e.target.value })}>
-              <option value="">first configured line</option>
-              {(instances || []).map((i) => (
-                <option key={i.id} value={String(i.id)}>
-                  {`line ${i.id}`
-                    + (i.msisdn ? ` · ${i.msisdn}` : '')
-                    + (i.iccid ? ` · …${String(i.iccid).slice(-4)}` : '')}
-                </option>
-              ))}
-            </select>
-            {!instances.length &&
-              <div style={{ fontSize: 11.5, color: '#f59e0b', marginTop: 6 }}>
-                Add a SIM under SIM Config first — Start needs a line to attach the SIP account to.
-              </div>}
-          </div>
+          {ubCards.map((card, i) => (
+            <div key={i} style={{
+              display: 'grid', gap: 8, marginBottom: 8, alignItems: 'end',
+              gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) auto',
+            }}>
+              <div><label>Line</label>
+                <select className="mono" value={card.line || ''}
+                  onChange={(e) => updCard(i, { line: e.target.value })}>
+                  <option value="">first configured line</option>
+                  {(instances || []).map((x) => (
+                    <option key={x.id} value={String(x.id)}>
+                      {`line ${x.id}`
+                        + (x.msisdn ? ` · ${x.msisdn}` : '')
+                        + (x.iccid ? ` · …${String(x.iccid).slice(-4)}` : '')}
+                    </option>
+                  ))}
+                </select></div>
+              <div><label>SIP username</label>
+                <input className="mono" value={card.sip_user || ''}
+                  onChange={(e) => updCard(i, { sip_user: e.target.value })}
+                  placeholder={`tgbridge${card.line || ''}`} /></div>
+              <div><label>Answered by</label>
+                <select className="mono" value={String(card.answer_owner || 0)}
+                  onChange={(e) => updCard(i, { answer_owner: Number(e.target.value) })}>
+                  <option value="0">{`you (${ub.owner_id || 'primary'})`}</option>
+                  {ubOwners.slice(1).map((o) => (
+                    <option key={o} value={String(o)}>{o}</option>
+                  ))}
+                </select></div>
+              <button className="btn btn-ghost" type="button"
+                onClick={() => updUb({ cards: ubCards.filter((_, j) => j !== i) })}>Remove</button>
+            </div>
+          ))}
+          <button className="btn btn-ghost" type="button"
+            onClick={() => updUb({
+              cards: [...ubCards, { line: '', sip_user: '', answer_owner: 0 }],
+            })}>Add card</button>
+          {dupCardUser &&
+            <div style={{ fontSize: 11.5, color: '#f59e0b', marginTop: 6 }}>
+              Two cards both use <code>{dupCardUser.sip_user}</code>. Give each line its own name.
+            </div>}
+          {!instances.length &&
+            <div style={{ fontSize: 11.5, color: '#f59e0b', marginTop: 6 }}>
+              Add a SIM under SIM Config first — Start needs a line to attach the SIP account to.
+            </div>}
           <div style={{ marginTop: 10 }}>
             <label>Numbers it may dial (comma separated)</label>
             <input className="mono"
@@ -560,12 +598,19 @@ function UserbotPill({ info }) {
       {note(st.last_error || 'it is probably failing at startup — check the log', '#ef4444')}
     </Row>
   }
+  // With more than one card, "SIP down" alone hides which one is missing.
+  const cards = Array.isArray(st.cards) ? st.cards : []
+  const up = cards.filter((c) => c.registered).length
+  const sipLabel = cards.length > 1
+    ? `SIP ${up}/${cards.length} registered`
+    : (st.sip_registered ? 'SIP registered' : 'SIP down')
   return <Row>
     {st.in_call ? pill('In a call', '#f59e0b') : pill('Running', '#22c55e')}
     {pill(st.telegram_connected ? 'Telegram up' : 'Telegram down',
       st.telegram_connected ? '#22c55e' : '#ef4444')}
-    {pill(st.sip_registered ? 'SIP registered' : 'SIP down',
-      st.sip_registered ? '#22c55e' : '#ef4444')}
+    {pill(sipLabel, st.sip_registered ? '#22c55e' : '#ef4444')}
+    {cards.filter((c) => !c.registered).map((c) =>
+      note(`line ${c.line} (${c.sip_user}) is not registered`, '#ef4444'))}
     {st.last_error ? note(st.last_error, '#ef4444') : null}
   </Row>
 }

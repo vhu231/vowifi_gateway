@@ -208,10 +208,16 @@ def tunnel_installed(iid: str) -> bool:
     return st is not None and st.get("state") == "CONNECTED"
 
 
-def rerender(iid: str) -> str:
+def rerender(iid: str, expect_user: str | None = None) -> str:
     """Rewrite Asterisk configs from the current instance.json and reload PJSIP,
     without recreating the engine. Used when an external SIP account is added for
-    the userbot while the line is already up."""
+    the userbot while the line is already up.
+
+    `expect_user` is an endpoint that must exist afterwards. Checking is not
+    paranoia: a container created before instance.json became a directory mount
+    holds the file by inode, so it renders from a copy the host can no longer
+    reach, and every step here still reports success.
+    """
     try:
         c = client().containers.get(container_name(iid))
     except docker.errors.NotFound:
@@ -227,6 +233,12 @@ def rerender(iid: str) -> str:
         text = out.decode(errors="replace") if isinstance(out, bytes) else str(out)
         if rc or "No such command" in text:
             return f"{command} failed: {text}"
+    if expect_user:
+        # -F: the section header is [name], and those brackets are a character
+        # class to grep. The rendered line is `[name](endpoint-local)`.
+        rc, _ = c.exec_run(["grep", "-qF", f"[{expect_user}]", "/etc/asterisk/pjsip.conf"])
+        if rc:
+            return "the engine is reading an older copy of its config"
     return "ok"
 
 

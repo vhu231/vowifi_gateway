@@ -24,7 +24,7 @@ import requests
 from telethon import TelegramClient, events
 
 from bridge import CallBridge
-from sip_leg import SipLeg
+from sip_leg import SipLeg, shutdown_endpoint
 from telegram_call import TelegramCallLeg
 
 logging.basicConfig(
@@ -36,11 +36,15 @@ log = logging.getLogger("userbot")
 
 HELP = """VoWiFi userbot
 
-/call <number> - I ring you, you answer, then I dial the number
+/call <number> [line] - I ring you, you answer, then I dial the number
+/use <line> - pick the card /call uses from now on
+/lines - list my cards and which of us answers each
 /dtmf <digits> - send tones during a call (e.g. /dtmf 1234)
 /hangup - end the current call
 
-Calls to this account are bridged out to the SIM line automatically."""
+Calls to a SIM are bridged to whoever answers that card."""
+
+SIP_USER_DEFAULT = "tgbridge"
 
 
 def load_config() -> dict:
@@ -52,20 +56,60 @@ def load_config() -> dict:
     sys.exit(1)
 
 
-def sip_params(cfg: dict) -> tuple[str, int, str]:
-    """Ask the control plane where this line's SIP service lives, and what our own
-    account's password is. Read-only, and the only thing the sidecar needs from the
-    gateway - calls themselves are pure SIP, so nothing here is needed at runtime."""
+def normalize_cards(cfg: dict) -> list[dict]:
+    """One entry per SIM we answer for. The control plane writes this list, but
+    a hand-written config (and anything from before multi-card) may still carry
+    a single sip_line/sip_user pair instead."""
+    cards = []
+    for raw in (cfg.get("cards") or []):
+        if not isinstance(raw, dict):
+            continue
+        cards.append({
+            "line": str(raw.get("line") or "").strip(),
+            "sip_user": str(raw.get("sip_user") or "").strip() or SIP_USER_DEFAULT,
+            "answer_owner": int(raw.get("answer_owner") or 0),
+            "sip_password": str(raw.get("sip_password") or "").strip(),
+        })
+    if cards:
+        return cards
+    return [{"line": str(cfg.get("sip_line") or "").strip(),
+             "sip_user": str(cfg.get("sip_user") or "").strip() or SIP_USER_DEFAULT,
+             "answer_owner": 0,
+             "sip_password": str(cfg.get("sip_password") or "").strip()}]
+
+
+def authorized_ids(cfg: dict) -> list[int]:
+    """Everyone allowed to drive us, primary first. Flat permissions: any of
+    them may dial on any card."""
+    out = []
+    for raw in [cfg.get("owner_id")] + list(cfg.get("owner_ids") or []):
+        try:
+            uid = int(str(raw).strip() or 0)
+        except (TypeError, ValueError):
+            continue
+        if uid and uid not in out:
+            out.append(uid)
+    return out
+
+
+def first_line(cfg: dict) -> str:
     base = cfg["gateway_url"].rstrip("/")
     verify = bool(cfg.get("gateway_verify_tls", False))
-    line = str(cfg.get("sip_line") or "")
-    if not line:
-        r = requests.get(f"{base}/api/instances", timeout=10, verify=verify)
-        r.raise_for_status()
-        instances = r.json().get("instances", [])
-        if not instances:
-            raise RuntimeError("the gateway has no configured lines")
-        line = str(instances[0]["id"])
+    r = requests.get(f"{base}/api/instances", timeout=10, verify=verify)
+    r.raise_for_status()
+    instances = r.json().get("instances", [])
+    if not instances:
+        raise RuntimeError("the gateway has no configured lines")
+    return str(instances[0]["id"])
+
+
+def sip_params(cfg: dict, card: dict) -> tuple[str, str, int, str]:
+    """Ask the control plane where this card's line lives, and what our own
+    account's password on it is. Read-only, and the only thing the sidecar needs
+    from the gateway - calls themselves are pure SIP."""
+    base = cfg["gateway_url"].rstrip("/")
+    verify = bool(cfg.get("gateway_verify_tls", False))
+    line = str(card.get("line") or "") or first_line(cfg)
     r = requests.get(f"{base}/api/instances/{line}/sipinfo", timeout=10, verify=verify)
     r.raise_for_status()
     info = r.json()
@@ -75,36 +119,44 @@ def sip_params(cfg: dict) -> tuple[str, int, str]:
     if info.get("transport") == "tls":
         # The endpoint reports the TLS port for a TLS line, and registering to it
         # over UDP just times out. Fail loudly rather than mysteriously.
-        raise RuntimeError("this line uses SIP/TLS; the userbot only speaks UDP so far")
+        raise RuntimeError(f"line {line} uses SIP/TLS; the userbot only speaks UDP so far")
     if not info.get("running"):
         log.warning("line %s is not running — SIP registration will fail until it is", line)
 
     # The gateway already knows our password: it is the external account the user
     # created in the WebUI. Taking it from here means one less secret to copy, and
     # it cannot go stale behind our back.
-    user = cfg["sip_user"]
+    user = card["sip_user"]
     accounts = {a.get("username"): a.get("password") for a in (info.get("accounts") or [])}
     if user not in accounts:
         raise RuntimeError(
             f"line {line} has no external SIP account called {user!r} "
             f"(it has: {', '.join(accounts) or 'none'}). Create one in the WebUI under "
             f"SIM Config -> External SIP accounts.")
-    password = cfg.get("sip_password") or accounts[user] or ""
+    password = card.get("sip_password") or accounts[user] or ""
     if not password:
         raise RuntimeError(f"external SIP account {user!r} has no password set")
 
     log.info("line %s speaks SIP at %s:%s as %s", line, host, port, user)
-    return host, port, password
+    return line, host, port, password
 
 
 class UserBot:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.owner = int(cfg["owner_id"])
+        self.owners = authorized_ids(cfg)
+        if not self.owners:
+            log.error("no owner_id configured — nobody would be allowed to use this")
+            sys.exit(1)
+        self.owner = self.owners[0]
+        self.cards = normalize_cards(cfg)
         self.allow = [str(n).strip() for n in (cfg.get("dial_allowlist") or []) if str(n).strip()]
         self.client = TelegramClient(cfg["session_name"], cfg["api_id"], cfg["api_hash"])
         self.bridge: CallBridge | None = None
-        self.sip: SipLeg | None = None
+        self.legs: dict[str, SipLeg] = {}
+        # Which card each account dials on, until they say /use. Sticky per
+        # account, not global: two people should not fight over one selection.
+        self.selected: dict[int, str] = {}
         self.last_error = ""
 
     # ---------- status ----------
@@ -118,13 +170,19 @@ class UserBot:
         path = self._status_path()
         try:
             tg = self.bridge.tg if self.bridge else None
+            cards = [{"line": line, "sip_user": leg.user, "registered": bool(leg.registered)}
+                     for line, leg in self.legs.items()]
             payload = {
                 "ts": int(time.time()),
                 "telegram_connected": bool(self.client.is_connected()),
-                "sip_registered": bool(self.sip and self.sip.registered),
+                # The WebUI pill reads this one: every card we manage to bring
+                # up must be registered before we claim the SIP side is healthy.
+                "sip_registered": bool(cards) and all(c["registered"] for c in cards),
                 "in_call": bool(tg and tg.active),
                 "owner_id": self.owner,
-                "sip_user": self.cfg.get("sip_user", ""),
+                "owner_ids": self.owners,
+                "cards": cards,
+                "sip_user": ", ".join(c["sip_user"] for c in cards),
                 "last_error": self.last_error,
             }
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -160,66 +218,108 @@ class UserBot:
         log.info("signed in as %s (id=%s)", me.first_name, me.id)
 
         heartbeat = asyncio.create_task(self._report_status())
-        try:
-            # sip_params is blocking HTTP. Run it off the loop so the heartbeat
-            # can actually write last_error / "not yet registered" while we wait.
-            host, port, password = await asyncio.to_thread(sip_params, self.cfg)
-        except Exception as e:  # noqa
-            # Setup mistakes land here: no such external account, the line is stopped,
-            # the line is TLS. Publish them so the WebUI can show what to fix instead
-            # of leaving them in this container's log. The pause is what gives the
-            # heartbeat a turn to write before we exit, and doubles as restart backoff.
-            self.last_error = str(e)
-            log.error("%s", e)
+        answerers: dict[str, int] = {}
+        failures: list[str] = []
+        for card in self.cards:
+            try:
+                # sip_params is blocking HTTP. Run it off the loop so the heartbeat
+                # can actually write last_error / "not yet registered" while we wait.
+                line, host, port, password = await asyncio.to_thread(
+                    sip_params, self.cfg, card)
+            except Exception as e:  # noqa
+                # Setup mistakes land here: no such external account, the line is
+                # stopped, the line is TLS. One bad card must not cost us the
+                # others, so record it and carry on.
+                log.error("card %s: %s", card.get("line") or "(first line)", e)
+                failures.append(f"line {card.get('line') or '?'}: {e}")
+                continue
+            if line in self.legs:
+                # Two cards resolved to one line (a blank one plus its explicit
+                # id, say). Keeping both would leave a leg nothing can reach.
+                log.warning("line %s is configured twice — ignoring the %s card",
+                            line, card["sip_user"])
+                continue
+            leg = SipLeg(card["sip_user"], password, host, port)
+            leg.start()
+            self.legs[line] = leg
+            answerers[line] = card.get("answer_owner") or self.owner
+
+        if not self.legs:
+            # Publish why before backing off, or the WebUI shows a container that
+            # is up and says nothing about what is wrong.
+            self.last_error = "; ".join(failures) or "no cards are configured"
+            await self._write_status()
             await asyncio.sleep(30)
             heartbeat.cancel()
-            raise
-
-        self.sip = SipLeg(self.cfg["sip_user"], password, host, port)
-        self.sip.start()
+            raise RuntimeError(self.last_error)
+        self.last_error = "; ".join(failures)
 
         loop = asyncio.get_running_loop()
-        tg = TelegramCallLeg(self.client, self.owner)
+        tg = TelegramCallLeg(self.client, self.owners)
         tg.install(loop)
-        self.bridge = CallBridge(tg, self.sip, loop)
+        self.bridge = CallBridge(tg, self.legs, answerers, loop)
 
         self.client.add_event_handler(self._on_message, events.NewMessage(incoming=True))
-        log.info("userbot ready — owner is %s", self.owner)
+        log.info("userbot ready — cards %s, authorised %s",
+                 ", ".join(self.legs) or "none",
+                 ", ".join(str(o) for o in self.owners))
         try:
             await self.client.run_until_disconnected()
         finally:
             heartbeat.cancel()
-            self.sip.stop()
+            for leg in self.legs.values():
+                leg.stop()
+            shutdown_endpoint()
+
+    def _card_for(self, who: int) -> str:
+        """The card this account dials on: their own /use choice, else the first."""
+        chosen = self.selected.get(who)
+        if chosen in self.legs:
+            return chosen
+        return next(iter(self.legs), "")
 
     async def _on_message(self, event):
-        # Only the owner, in their own private chat. Anyone else is ignored
-        # without a reply, same as the control-plane bot.
-        if event.chat_id != self.owner or not event.raw_text:
+        # Only an authorised account, in its own private chat. Anyone else is
+        # ignored without a reply, same as the control-plane bot.
+        who = event.chat_id
+        if who not in self.owners or not event.raw_text:
             return
         text = event.raw_text.strip()
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@", 1)[0].lower(), arg.strip()
-        if cmd not in ("/start", "/help", "/call", "/dtmf", "/hangup"):
+        if cmd not in ("/start", "/help", "/call", "/use", "/lines", "/dtmf", "/hangup"):
             return
         try:
-            reply = await self._run_command(cmd, arg)
+            reply = await self._run_command(who, cmd, arg)
         except Exception as e:  # noqa
             # Telethon would swallow this into the container log, leaving the
-            # owner staring at a command that answered nothing at all.
+            # caller staring at a command that answered nothing at all.
             log.exception("%s failed", cmd)
             reply = f"{cmd} failed: {type(e).__name__}: {e}"
         await event.reply(reply)
 
-    async def _run_command(self, cmd: str, arg: str) -> str:
+    async def _run_command(self, who: int, cmd: str, arg: str) -> str:
         if cmd in ("/start", "/help"):
             return HELP
+        if cmd == "/lines":
+            return (self.bridge.describe_lines()
+                    + f"\n\nYou are dialling on line {self._card_for(who)}.")
+        if cmd == "/use":
+            line = arg.split()[0] if arg else ""
+            if line not in self.legs:
+                return f"Usage: /use <line>. I have: {', '.join(self.legs) or 'no cards'}."
+            self.selected[who] = line
+            return f"Your calls now go out on line {line}."
         if cmd == "/call":
-            number = arg.split()[0] if arg else ""
+            parts = arg.split()
+            number = parts[0] if parts else ""
             if not number:
-                return "Usage: /call <number>"
+                return "Usage: /call <number> [line]"
             if not self._may_dial(number):
                 return f"{number} is not in this userbot's dial allow-list."
-            return await self.bridge.place_call(number)
+            # A trailing line wins for this call only; it does not move /use.
+            line = parts[1] if len(parts) > 1 else self._card_for(who)
+            return await self.bridge.place_call(number, line, who)
         if cmd == "/dtmf":
             return self.bridge.send_dtmf(arg)
         return await self.bridge.hangup()

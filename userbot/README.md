@@ -108,15 +108,36 @@ Then, in order: registration comes up (`SIP registration: up` in the log),
 
 ## Commands
 
-Only the configured `owner_id` is obeyed, in their own private chat. Anything
-else is ignored without a reply.
+`owner_id` plus anything in `owner_ids` is obeyed, each in their own private
+chat. Anything else is ignored without a reply. Permissions are flat: everyone
+listed may dial on every card, and one call runs at a time.
 
-- `/call <number>` — rings you first, dials the number once you answer
+- `/call <number> [line]` — rings *you* first, dials once you answer
+- `/use <line>` — the card your `/call` uses from now on, remembered per account
+- `/lines` — the cards, whether each is registered, and who answers it
 - `/dtmf <digits>` — multi-digit, PJSUA2 handles the inter-digit timing
 - `/hangup`
 
 `dial_allowlist` in the config restricts what may be dialled. This process can
 place calls, so if the set of numbers is predictable, pin it down.
+
+## Cards
+
+Each entry in `cards` is one SIM the userbot answers for:
+
+```json
+{"line": "1", "sip_user": "tgbridge", "answer_owner": 0}
+```
+
+`answer_owner` is who gets rung when that SIM receives a call; `0` means the
+primary account. **SIP usernames must differ between lines.** Every account is
+registered from one PJSUA2 endpoint, and two accounts sharing a
+`sip:user@host` identity make an inbound call ambiguous — PJSIP hands it to
+whichever it matches first, which may be the wrong SIM. The control plane
+refuses a name another line already uses.
+
+A config from before multi-card, carrying a single `sip_line`/`sip_user` pair,
+is read as one card with that same username.
 
 ## Why it is built this way
 

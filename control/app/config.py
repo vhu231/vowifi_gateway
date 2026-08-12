@@ -494,6 +494,42 @@ _SIP_RESERVED_USERNAMES = frozenset({
 })
 
 
+def validate_sip_username(username: str) -> None:
+    """Reject a name Asterisk reserves for itself. Raises ValueError."""
+    name = str(username or "").strip()
+    if not name:
+        raise ValueError("a SIP username cannot be empty")
+    if name in _SIP_RESERVED_USERNAMES:
+        raise ValueError(
+            f"SIP username '{name}' is reserved (used by the built-in softphone "
+            "or Asterisk internals). Choose a different name."
+        )
+
+
+def _sip_username_line_in(data: dict, username: str, exclude_iid: str | None = None) -> str | None:
+    name = str(username or "").strip()
+    if not name:
+        return None
+    for iid, inst in (data.get("instances") or {}).items():
+        if exclude_iid is not None and str(iid) == str(exclude_iid):
+            continue
+        for account in ((inst.get("sip") or {}).get("external") or []):
+            if isinstance(account, dict) and str(account.get("username") or "").strip() == name:
+                return str(iid)
+    return None
+
+
+def sip_username_line(username: str, exclude_iid: str | None = None) -> str | None:
+    """The line already using this external SIP username, if any.
+
+    Names have to be unique across lines and not merely within one, because the
+    userbot sidecar registers every line's account from a single PJSUA2
+    endpoint: two accounts sharing a `sip:user@host` identity make an inbound
+    call ambiguous, and PJSIP hands it to whichever it matches first.
+    """
+    return _sip_username_line_in(load(), username, exclude_iid)
+
+
 def validate_sip_external_usernames(sip: dict | None) -> None:
     """Reject external SIP names that would collide in the rendered pjsip config."""
     sip = sip or {}
@@ -621,6 +657,23 @@ def upsert_instance(inst: dict) -> dict:
         prev = (existing.get("sip", {}) or {}).get("webrtc", {}) or {}
         wr["password"] = prev.get("password") or secrets.token_urlsafe(12)
     validate_sip_external_usernames(sip)
+    # Cross-line uniqueness, but only for names this save introduces: a clash
+    # that predates it is not something the user can fix from this form.
+    had = {str(a.get("username") or "").strip()
+           for a in ((existing.get("sip") or {}).get("external") or [])
+           if isinstance(a, dict)}
+    for account in (sip.get("external") or []):
+        if not isinstance(account, dict):
+            continue
+        name = str(account.get("username") or "").strip()
+        if not name or name in had:
+            continue
+        clash = _sip_username_line_in(data, name, exclude_iid=iid)
+        if clash:
+            raise ValueError(
+                f"SIP username '{name}' already belongs to line {clash}. Names must be "
+                "unique across lines, or the userbot cannot register them all at once."
+            )
     data["instances"][iid] = merged
     save(data)
     return merged

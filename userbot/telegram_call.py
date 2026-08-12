@@ -182,9 +182,12 @@ class TelegramCallLeg:
       on_ended()      - the call is gone; tear down the other leg
     """
 
-    def __init__(self, client: TelegramClient, owner_id: int):
+    def __init__(self, client: TelegramClient, owners):
         self.client = client
-        self.owner_id = int(owner_id)
+        # Every account allowed to drive the bridge. Permissions are flat: any
+        # of them may be called, and a call from any of them is taken.
+        self.owners = [int(o) for o in owners if int(o)]
+        self.peer_id: int | None = None     # who this call is with
         self.on_pcm = None
         self.on_connected = None
         self.on_ended = None
@@ -270,9 +273,9 @@ class TelegramCallLeg:
 
     # ---------- placing a call ----------
 
-    async def place_call(self) -> bool:
-        """Ring the owner. The DH half here is the CALLER side: we publish
-        g_a_hash up front and only reveal g_a once they accept.
+    async def place_call(self, peer_id: int) -> bool:
+        """Ring one of the authorised accounts. The DH half here is the CALLER
+        side: we publish g_a_hash up front and only reveal g_a once they accept.
 
         Unlike the answering path below, this direction has no published working
         reference — if a placed call connects silently, the DH exchange is the
@@ -281,11 +284,16 @@ class TelegramCallLeg:
         if self.active:
             log.warning("a call is already in progress")
             return False
-        try:
-            peer = await self.client.get_input_entity(self.owner_id)
-        except Exception as e:  # noqa
-            log.error("cannot resolve owner %s: %s", self.owner_id, e)
+        peer_id = int(peer_id)
+        if peer_id not in self.owners:
+            log.warning("refusing to call %s — not an authorised account", peer_id)
             return False
+        try:
+            peer = await self.client.get_input_entity(peer_id)
+        except Exception as e:  # noqa
+            log.error("cannot resolve account %s: %s", peer_id, e)
+            return False
+        self.peer_id = peer_id
         try:
             return await self._place_call(peer)
         except Exception:
@@ -296,8 +304,8 @@ class TelegramCallLeg:
             raise
 
     async def _place_call(self, peer) -> bool:
-        self._ntg_id = await self._ntg_call(self._ntg.create_p2p_call, self.owner_id) \
-            or self.owner_id
+        self._ntg_id = await self._ntg_call(self._ntg.create_p2p_call, self.peer_id) \
+            or self.peer_id
         await self._ntg_call(self._ntg.set_stream_sources, self._ntg_id,
                              ntgcalls.StreamMode.CAPTURE, _audio_source())
 
@@ -322,22 +330,24 @@ class TelegramCallLeg:
         ))
         call = res.phone_call
         self._call_id, self._access_hash = call.id, call.access_hash
-        log.info("calling owner %s (call_id=%s)", self.owner_id, call.id)
+        log.info("calling %s (call_id=%s)", self.peer_id, call.id)
         return True
 
     # ---------- answering a call ----------
 
     async def _accept(self, req: PhoneCallRequested):
-        if req.admin_id != self.owner_id:
-            log.warning("refusing call from %s (only %s may call)", req.admin_id, self.owner_id)
+        if int(req.admin_id) not in self.owners:
+            log.warning("refusing call from %s (authorised: %s)",
+                        req.admin_id, ", ".join(str(o) for o in self.owners))
             await self._discard(req.id, req.access_hash)
             return
         self._call_id, self._access_hash = req.id, req.access_hash
+        self.peer_id = int(req.admin_id)
 
         # Ordering, rule 1: the session and the outbound source exist before any
         # key material is exchanged.
-        self._ntg_id = await self._ntg_call(self._ntg.create_p2p_call, self.owner_id) \
-            or self.owner_id
+        self._ntg_id = await self._ntg_call(self._ntg.create_p2p_call, self.peer_id) \
+            or self.peer_id
         await self._ntg_call(self._ntg.set_stream_sources, self._ntg_id,
                              ntgcalls.StreamMode.CAPTURE, _audio_source())
 
@@ -468,12 +478,16 @@ class TelegramCallLeg:
         if self._sender:
             self._sender.stop()
             self._sender = None
-        if self._ntg_id is not None:
+        # Take the handle before stopping it: the SIP side and the Telegram side
+        # can both start tearing down at once, and the loser would otherwise
+        # stop a connection ntgcalls has already forgotten.
+        ntg_id, self._ntg_id = self._ntg_id, None
+        if ntg_id is not None:
             try:
-                await self._ntg_call(self._ntg.stop, self._ntg_id)
+                await self._ntg_call(self._ntg.stop, ntg_id)
             except Exception as e:  # noqa
                 log.debug("ntgcalls stop: %s", e)
-        self._call_id = self._access_hash = self._ntg_id = None
+        self._call_id = self._access_hash = self.peer_id = None
         self._connected = self._signaling_ready = False
         self._queued_signaling.clear()
         self._last_warning = None
