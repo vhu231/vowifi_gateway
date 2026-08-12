@@ -26,6 +26,7 @@ from fastapi import HTTPException
 
 from . import config as cfg
 from . import store
+from . import userbot as userbot_cfg
 
 log = logging.getLogger("vowifi.telegram")
 
@@ -69,7 +70,18 @@ eSIM (if enabled):
 /esim_delete <iccid> - permanent
 /esim_download <activation code>
 /esim_notify - pending notifications
-/esim_notify_process <seq|all>"""
+/esim_notify_process <seq|all>
+
+Calls (/call, /dtmf, /hangup) belong to the userbot account, not to me -
+send those in its chat. My /use and /lines are about SMS and line control;
+its own /use and /lines are about which SIM it dials on."""
+
+# Commands the call sidecar owns. It is a separate Telegram account in its own
+# chat, so the two never see each other's messages - which is exactly why one of
+# them arriving here is worth answering rather than calling it unknown.
+# userbot/main.py carries the mirror of this list; the sidecar ships without the
+# control plane's code, so a shared import is not available to it.
+_USERBOT_COMMANDS = ("/call", "/dtmf", "/hangup")
 
 # Structured 409/400 codes the route handlers raise, in words a chat can act on.
 _CODE_HELP = {
@@ -265,7 +277,10 @@ class TelegramBot:
         for inst in cfg.list_instances():
             iid = str(inst.get("id"))
             mark = " <- current" if iid == current else ""
-            rows.append(f"{iid}. {inst.get('name') or 'unnamed'} "
+            # The number the SIM answers as is the one thing that tells two
+            # lines apart at a glance; it is read from the SIM, so it can be blank.
+            number = str(inst.get("msisdn") or "").strip() or "number unknown"
+            rows.append(f"{iid}. {number} · {inst.get('name') or 'unnamed'} "
                         f"{inst.get('mcc')}-{inst.get('mnc')}{mark}")
         await self.send(chat, "\n".join(rows) or "No lines are configured yet.")
 
@@ -881,10 +896,30 @@ class TelegramBot:
                 return
             handler = self._ESIM_COMMANDS[cmd]
         if not handler:
-            if text.startswith("/"):
+            if cmd in _USERBOT_COMMANDS:
+                await self._point_at_userbot(chat, cmd)
+            elif text.startswith("/"):
                 await self.send(chat, "Unknown command. /help lists what I understand.")
             return
         await getattr(self, handler)(chat, arg, msg)
+
+    async def _point_at_userbot(self, chat: str, cmd: str):
+        """Calls are bridged by a different Telegram account, so this command is
+        not unknown - it is just in the wrong chat. Say which chat, and whether
+        the thing is even running."""
+        try:
+            phone = str(userbot_cfg.load().get("phone") or "").strip()
+            live = bool(userbot_cfg.status().get("running"))
+        except Exception as e:  # noqa
+            log.debug("userbot lookup for %s: %s", cmd, e)
+            phone, live = "", False
+        if not phone:
+            await self.send(chat, f"{cmd} belongs to the call bridge, which is not set up yet. "
+                                  "Settings -> Telegram calls (userbot).")
+            return
+        tail = "" if live else " It is not running right now — start it in Settings."
+        await self.send(chat, f"{cmd} belongs to the userbot account ({phone}), not to me. "
+                              f"Send it in that account's own chat.{tail}")
 
     async def _handle_update(self, update: dict, tg: dict, commands: dict):
         msg = update.get("message") or update.get("edited_message")

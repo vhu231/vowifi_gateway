@@ -121,6 +121,11 @@ listed may dial on every card, and one call runs at a time.
 `dial_allowlist` in the config restricts what may be dialled. This process can
 place calls, so if the set of numbers is predictable, pin it down.
 
+An inbound call is announced in chat before the phone rings, because the
+Telegram call itself only names the userbot: the message is what tells you who
+is actually calling and which SIM they dialled. One arriving while you are
+already talking is reported as missed rather than dropped silently.
+
 When a call is over, whoever was on it gets a summary: the number, the card, the
 time it started, how long it took to connect, and how long you talked. A call
 nobody took is reported too — for an inbound one that is the only trace the SIM

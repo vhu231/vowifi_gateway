@@ -42,9 +42,25 @@ HELP = """VoWiFi userbot
 /dtmf <digits> - send tones during a call (e.g. /dtmf 1234)
 /hangup - end the current call
 
-Calls to a SIM are bridged to whoever answers that card."""
+Calls to a SIM are bridged to whoever answers that card.
+
+I only do calls. SMS, line control and eSIM belong to the gateway bot, in its
+own chat — including its own /use and /lines, which pick the line those
+commands act on rather than the SIM I dial from."""
 
 SIP_USER_DEFAULT = "tgbridge"
+
+# Commands the gateway's notification bot owns. It is a different account in a
+# different chat, so one of these turning up here means the wrong window, which
+# is worth saying instead of ignoring. Mirrors _USERBOT_COMMANDS in
+# control/app/telegram_bot.py: this container ships without the control plane's
+# code, so the two lists cannot share an import.
+GATEWAY_COMMANDS = (
+    "/status", "/sms", "/msgs", "/pin",
+    "/line_start", "/line_stop", "/line_register", "/line_reprovision",
+    "/esim", "/esim_profiles", "/esim_enable", "/esim_disable", "/esim_delete",
+    "/esim_download", "/esim_notify", "/esim_notify_process",
+)
 
 
 def load_config() -> dict:
@@ -103,10 +119,10 @@ def first_line(cfg: dict) -> str:
     return str(instances[0]["id"])
 
 
-def sip_params(cfg: dict, card: dict) -> tuple[str, str, int, str]:
-    """Ask the control plane where this card's line lives, and what our own
-    account's password on it is. Read-only, and the only thing the sidecar needs
-    from the gateway - calls themselves are pure SIP."""
+def sip_params(cfg: dict, card: dict) -> dict:
+    """Ask the control plane where this card's line lives, what our own account's
+    password on it is, and which number the SIM answers as. Read-only, and the
+    only thing the sidecar needs from the gateway - calls are pure SIP."""
     base = cfg["gateway_url"].rstrip("/")
     verify = bool(cfg.get("gateway_verify_tls", False))
     line = str(card.get("line") or "") or first_line(cfg)
@@ -138,7 +154,8 @@ def sip_params(cfg: dict, card: dict) -> tuple[str, str, int, str]:
         raise RuntimeError(f"external SIP account {user!r} has no password set")
 
     log.info("line %s speaks SIP at %s:%s as %s", line, host, port, user)
-    return line, host, port, password
+    return {"line": line, "host": host, "port": port, "password": password,
+            "msisdn": str(info.get("msisdn") or "").strip()}
 
 
 class UserBot:
@@ -218,14 +235,14 @@ class UserBot:
         log.info("signed in as %s (id=%s)", me.first_name, me.id)
 
         heartbeat = asyncio.create_task(self._report_status())
-        answerers: dict[str, int] = {}
+        known: dict[str, dict] = {}
         failures: list[str] = []
         for card in self.cards:
             try:
                 # sip_params is blocking HTTP. Run it off the loop so the heartbeat
                 # can actually write last_error / "not yet registered" while we wait.
-                line, host, port, password = await asyncio.to_thread(
-                    sip_params, self.cfg, card)
+                found = await asyncio.to_thread(sip_params, self.cfg, card)
+                line = found["line"]
             except Exception as e:  # noqa
                 # Setup mistakes land here: no such external account, the line is
                 # stopped, the line is TLS. One bad card must not cost us the
@@ -239,10 +256,11 @@ class UserBot:
                 log.warning("line %s is configured twice — ignoring the %s card",
                             line, card["sip_user"])
                 continue
-            leg = SipLeg(card["sip_user"], password, host, port)
+            leg = SipLeg(card["sip_user"], found["password"], found["host"], found["port"])
             leg.start()
             self.legs[line] = leg
-            answerers[line] = card.get("answer_owner") or self.owner
+            known[line] = {"answerer": card.get("answer_owner") or self.owner,
+                           "msisdn": found["msisdn"]}
 
         if not self.legs:
             # Publish why before backing off, or the WebUI shows a container that
@@ -257,7 +275,7 @@ class UserBot:
         loop = asyncio.get_running_loop()
         tg = TelegramCallLeg(self.client, self.owners)
         tg.install(loop)
-        self.bridge = CallBridge(tg, self.legs, answerers, loop)
+        self.bridge = CallBridge(tg, self.legs, known, loop)
 
         self.client.add_event_handler(self._on_message, events.NewMessage(incoming=True))
         log.info("userbot ready — cards %s, authorised %s",
@@ -287,7 +305,12 @@ class UserBot:
         text = event.raw_text.strip()
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@", 1)[0].lower(), arg.strip()
+        if cmd in GATEWAY_COMMANDS:
+            await event.reply(f"{cmd} belongs to the gateway bot, not to me — send it in that "
+                              f"chat. I only bridge calls: /call, /use, /lines, /dtmf, /hangup.")
+            return
         if cmd not in ("/start", "/help", "/call", "/use", "/lines", "/dtmf", "/hangup"):
+            # Anything else is somebody talking, not commanding. Stay quiet.
             return
         try:
             reply = await self._run_command(who, cmd, arg)
@@ -303,7 +326,8 @@ class UserBot:
             return HELP
         if cmd == "/lines":
             return (self.bridge.describe_lines()
-                    + f"\n\nYou are dialling on line {self._card_for(who)}.")
+                    + f"\n\nYou are dialling on line {self._card_for(who)}."
+                    + "\n(These are my SIP cards. The gateway bot's /lines lists its lines.)")
         if cmd == "/use":
             line = arg.split()[0] if arg else ""
             if line not in self.legs:

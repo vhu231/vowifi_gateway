@@ -57,10 +57,11 @@ def _caller_number(uri: str) -> str:
 
 
 class CallBridge:
-    def __init__(self, tg_leg, sip_legs: dict, answerers: dict, loop: asyncio.AbstractEventLoop):
+    def __init__(self, tg_leg, sip_legs: dict, cards: dict, loop: asyncio.AbstractEventLoop):
         self.tg = tg_leg
         self.legs = dict(sip_legs)          # line id -> SipLeg
-        self.answerers = dict(answerers)    # line id -> Telegram user id to ring
+        # line id -> {"answerer": Telegram user id to ring, "msisdn": the SIM's number}
+        self.cards = dict(cards)
         self.loop = loop
         # The leg joined to the current Telegram call. None means no SIP call
         # belongs to us, even if some leg is ringing.
@@ -101,9 +102,10 @@ class CallBridge:
     def describe_lines(self) -> str:
         rows = []
         for line, leg in self.legs.items():
-            rows.append(f"line {line}: {leg.user} — "
-                        f"{'registered' if leg.registered else 'NOT registered'}, "
-                        f"answered by {self.answerers.get(line) or 'nobody'}")
+            card = self.cards.get(line) or {}
+            rows.append(f"line {line}: {card.get('msisdn') or 'number unknown'} · {leg.user} · "
+                        f"{'registered' if leg.registered else 'NOT registered'} · "
+                        f"answered by {card.get('answerer') or 'nobody'}")
         return "\n".join(rows) or "No cards are configured."
 
     # ---------- outbound ----------
@@ -136,15 +138,27 @@ class CallBridge:
         """Runs on a PJSIP thread; hop back onto the loop to touch Telethon."""
         asyncio.run_coroutine_threadsafe(self._ring_answerer(line, peer), self.loop)
 
+    def _card_label(self, line: str) -> str:
+        number = (self.cards.get(line) or {}).get("msisdn")
+        return f"{number} (line {line})" if number else f"line {line}"
+
     async def _ring_answerer(self, line: str, peer: str):
+        who = (self.cards.get(line) or {}).get("answerer")
+        number = _caller_number(peer)
         if self.tg.active:
             log.info("line %s: call from %s while busy — leaving it to ring elsewhere", line, peer)
+            if who:
+                await self._announce(who, f"Missed call from {number} on "
+                                          f"{self._card_label(line)} — you were already talking.")
             return
-        who = self.answerers.get(line)
         if not who:
             log.warning("line %s: call from %s but no answerer is configured", line, peer)
             return
         log.info("line %s: call from %s — ringing %s on Telegram", line, peer, who)
+        # The Telegram call only says who the *userbot* is. Without this the
+        # answerer has no idea who is actually calling until they pick up.
+        await self._announce(who, f"Incoming call from {number} on "
+                                  f"{self._card_label(line)} — ringing you now.")
         self._inbound = (line, peer)
         self._session = {"direction": "in", "line": line, "number": _caller_number(peer),
                          "who": who, "started": time.time(), "answered": None}
@@ -236,16 +250,21 @@ class CallBridge:
             return f"Not connected\n{head}\nRang at {began} for {rang} — {missed}"
         return f"No answer\n{head}\nRang at {began} for {rang}"
 
+    async def _announce(self, who: int, text: str):
+        """A chat message alongside the call itself. Awaited rather than fired
+        off: it costs a few hundred milliseconds against a sixty second ring,
+        and this way it lands before the phone starts buzzing."""
+        try:
+            await self.tg.client.send_message(who, text)
+        except Exception as e:  # noqa
+            log.warning("could not message %s: %s", who, e)
+
     async def _report(self, session: dict):
         """Tell whoever was on the call how it went. A missed inbound call is
         worth saying too — it is the only trace the SIM rang at all."""
         who = session.get("who")
-        if not who:
-            return
-        try:
-            await self.tg.client.send_message(who, self._summary(session))
-        except Exception as e:  # noqa
-            log.warning("could not send the call summary: %s", e)
+        if who:
+            await self._announce(who, self._summary(session))
 
     def _sip_ended(self, line: str):
         leg = self.legs.get(line)
