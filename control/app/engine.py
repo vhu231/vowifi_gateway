@@ -81,7 +81,9 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False):
         pass
 
     volumes = {
-        os.path.join(host_base, "instance.json"): {"bind": "/config/instance.json", "mode": "ro"},
+        # Directory mount, not the file: a file bind sticks to one inode, so
+        # rewriting instance.json on the host is invisible inside a running engine.
+        host_base: {"bind": "/config", "mode": "ro"},
         os.path.join(host_base, "logs"): {"bind": "/logs", "mode": "rw"},
         os.path.join(host_base, "run"): {"bind": "/run/vowifi", "mode": "rw"},
         PCSCD_SOCK: {"bind": "/run/pcscd", "mode": "rw"},
@@ -218,10 +220,13 @@ def rerender(iid: str) -> str:
     text1 = out1.decode(errors="replace") if isinstance(out1, bytes) else str(out1)
     if rc1:
         return f"render failed: {text1}"
-    rc2, out2 = c.exec_run(["asterisk", "-rx", "pjsip reload"])
-    text2 = out2.decode(errors="replace") if isinstance(out2, bytes) else str(out2)
-    if rc2:
-        return f"pjsip reload failed: {text2}"
+    # This Asterisk has no `pjsip reload` (CLI still exits 0 with "No such command").
+    # Reloading the module re-reads pjsip.conf; dialplan reload picks up new local endpoints.
+    for command in ("module reload res_pjsip.so", "dialplan reload"):
+        rc, out = c.exec_run(["asterisk", "-rx", command])
+        text = out.decode(errors="replace") if isinstance(out, bytes) else str(out)
+        if rc or "No such command" in text:
+            return f"{command} failed: {text}"
     return "ok"
 
 

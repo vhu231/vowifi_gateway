@@ -559,25 +559,30 @@ def ensure_sip_account(conf: dict) -> str | None:
         conf["sip_line"] = iid
     sip = dict(inst.get("sip") or {})
     external = [a for a in (sip.get("external") or []) if isinstance(a, dict)]
-    if any(str(a.get("username") or "").strip() == user for a in external):
-        return None
-    password = str(conf.get("sip_password") or "").strip() or secrets.token_urlsafe(12)
-    external.append({"username": user, "password": password})
-    try:
-        inst = cfg.upsert_instance({"id": iid, "sip": {**sip, "external": external}})
-    except ValueError as e:
-        raise NotReady(str(e)) from e
+    created = False
+    if not any(str(a.get("username") or "").strip() == user for a in external):
+        password = str(conf.get("sip_password") or "").strip() or secrets.token_urlsafe(12)
+        external.append({"username": user, "password": password})
+        try:
+            inst = cfg.upsert_instance({"id": iid, "sip": {**sip, "external": external}})
+        except ValueError as e:
+            raise NotReady(str(e)) from e
+        created = True
+    # Account may already be in config.yaml from an earlier Start that never
+    # reached a live Asterisk reload. Always re-render a running engine.
     if engine.is_running(iid):
         settings = (cfg.load() or {}).get("settings") or {}
         cfg.write_instance_json(inst, settings)
         result = engine.rerender(iid)
         if result != "ok":
-            log.warning("userbot: added SIP account %s on line %s but reload said %s",
+            log.warning("userbot: SIP account %s on line %s reload said %s",
                         user, iid, result)
-            return (f"created SIP account {user} on line {iid}, but the running engine "
-                    f"did not reload ({result}) — Stop → Start that line")
-    log.info("created external SIP account %s on line %s", user, iid)
-    return f"created SIP account {user} on line {iid}"
+            return (f"{'created' if created else 'found'} SIP account {user} on line {iid}, "
+                    f"but the running engine did not reload ({result}) — Stop → Start that line")
+    if created:
+        log.info("created external SIP account %s on line %s", user, iid)
+        return f"created SIP account {user} on line {iid}"
+    return None
 
 
 def prepare_and_start(body: dict | None = None) -> dict:

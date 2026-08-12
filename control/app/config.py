@@ -950,8 +950,15 @@ def write_instance_json(inst: dict, settings: dict) -> str:
     d = os.path.join(DATA_DIR, "instances", str(inst["id"]))
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, "instance.json")
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(render_instance_json(inst, settings), f, indent=2)
-    os.replace(tmp, path)
+    payload = json.dumps(render_instance_json(inst, settings), indent=2)
+    # The engine bind-mounts this file (or its parent dir). os.replace() swaps
+    # the inode; a running container keeps the old one and Asterisk never sees
+    # new SIP accounts. Truncate-and-write the existing inode instead.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, payload.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     return path
