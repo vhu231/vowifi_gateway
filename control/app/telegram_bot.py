@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections import OrderedDict
 
@@ -40,6 +41,9 @@ _STALE_UPDATE_AGE = 60
 _MAX_REPLY_TARGETS = 200
 _MAX_TRACKED_SENDS = 200
 _CONFIRM_TTL = 120
+# How long a chat's eSIM reader/eUICC pick stays current. Long enough to run a few commands,
+# short enough that a forgotten selection can't act on a card that has since been swapped.
+_ESIM_TARGET_TTL = 600
 
 _HELP = """VoWiFi gateway
 
@@ -55,7 +59,17 @@ Line control (if enabled):
 /line_stop <line>
 /line_register <line>
 /line_reprovision <line>
-/pin <line> <pin> - unlock and start"""
+/pin <line> <pin> - unlock and start
+
+eSIM (if enabled):
+/esim - pick the reader (and eUICC) to work on
+/esim_profiles - list profiles on it
+/esim_enable <iccid> - switch profile
+/esim_disable <iccid>
+/esim_delete <iccid> - permanent
+/esim_download <activation code>
+/esim_notify - pending notifications
+/esim_notify_process <seq|all>"""
 
 # Structured 409/400 codes the route handlers raise, in words a chat can act on.
 _CODE_HELP = {
@@ -134,6 +148,10 @@ class TelegramBot:
         self._sent: OrderedDict[int, tuple[str, int]] = OrderedDict()
         self._pending: dict[str, dict] = {}           # confirm token -> queued action
         self._confirm_seq = 0
+        # eSIM is addressed by READER, not by line, so it needs its own per-chat selection.
+        self._esim_target: dict[str, dict] = {}       # chat -> {reader, index, se_id, aid, ts}
+        self._typed: dict[str, dict] = {}             # chat -> a pending type-this-to-confirm
+        self._downloads: dict[str, dict] = {}         # reader -> {chat, message_id, last_edit}
         self._unsubscribe = None
 
     # ---------------- Telegram plumbing ----------------
@@ -184,7 +202,11 @@ class TelegramBot:
 
     async def on_event(self, msg: dict):
         """Hub subscriber. The send API only confirms that IMS accepted the message; the real
-        verdict arrives later from the delivery watcher, so rewrite the original chat line."""
+        verdict arrives later from the delivery watcher, so rewrite the original chat line.
+        eSIM downloads report progress the same way."""
+        if msg.get("type") == "esim_download":
+            await self._on_download_event(msg)
+            return
         if msg.get("type") != "sms":
             return
         rec = msg.get("message") or {}
@@ -362,21 +384,41 @@ class TelegramBot:
 
     # ---------------- confirmations ----------------
 
+    async def _ask(self, chat: str, prompt: str, run, yes: str = "Confirm",
+                   cancelled: str = "Cancelled."):
+        """Put an action behind a yes/no prompt. `run` receives a resolve(text) callback that
+        rewrites the prompt, so every outcome lands in the message that asked the question."""
+        self._expire_pending()
+        # A counter, not a timestamp: two confirmations raised in the same millisecond would
+        # otherwise share a token, and the first button would act on the second one's target.
+        self._confirm_seq += 1
+        token = str(self._confirm_seq)
+        self._pending[token] = {"chat": chat, "run": run, "cancelled": cancelled,
+                                "ts": time.time()}
+        await self.send(chat, prompt,
+                        keyboard=[[{"text": yes, "callback_data": f"go:{token}"},
+                                   {"text": "Cancel", "callback_data": f"no:{token}"}]])
+
     async def _confirm(self, chat: str, arg: str, verb: str, warning: str, run):
         iid, err = self._resolve_line(chat, arg)
         if not iid:
             await self.send(chat, err)
             return
-        self._expire_pending()
-        # A counter, not a timestamp: two confirmations raised in the same millisecond would
-        # otherwise share a token, and the first button would act on the second line.
-        self._confirm_seq += 1
-        token = str(self._confirm_seq)
-        self._pending[token] = {"chat": chat, "iid": iid, "verb": verb, "run": run,
-                                "ts": time.time()}
-        await self.send(chat, f"{warning}\nConfirm {verb} of line {iid}?",
-                        keyboard=[[{"text": f"Yes, {verb}", "callback_data": f"go:{token}"},
-                                   {"text": "Cancel", "callback_data": f"no:{token}"}]])
+
+        async def _do(resolve):
+            await resolve(f"Line {iid}: {verb} in progress…")
+            try:
+                await run(iid)
+            except HTTPException as e:
+                await resolve(f"Line {iid}: {verb} refused — {_explain(e)}")
+                return
+            except Exception as e:  # noqa
+                await resolve(f"Line {iid}: {verb} failed — {e}")
+                return
+            await resolve(f"Line {iid}: {verb} done.")
+
+        await self._ask(chat, f"{warning}\nConfirm {verb} of line {iid}?", _do,
+                        yes=f"Yes, {verb}", cancelled=f"Cancelled — line {iid} left alone.")
 
     def _expire_pending(self):
         cutoff = time.time() - _CONFIRM_TTL
@@ -401,24 +443,370 @@ class TelegramBot:
         await self._api("answerCallbackQuery", {"callback_query_id": cb.get("id")}, timeout=10)
         self._expire_pending()
         action, _, token = data.partition(":")
+        # Reader / eUICC picks are plain selections, not guarded actions.
+        if action == "esr":
+            await self._select_reader(chat, int(token), self._reader_name(int(token)),
+                                      resolve=resolve)
+            return
+        if action == "ese":
+            await self._select_se(chat, token, resolve)
+            return
         pending = self._pending.pop(token, None)
         if not pending or pending["chat"] != chat:
             await resolve("That confirmation has expired — run the command again.")
             return
         if action != "go":
-            await resolve(f"Cancelled — line {pending['iid']} left alone.")
+            await resolve(pending.get("cancelled") or "Cancelled.")
             return
-        iid, verb = pending["iid"], pending["verb"]
-        await resolve(f"Line {iid}: {verb} in progress…")
         try:
-            await pending["run"](iid)
-        except HTTPException as e:
-            await resolve(f"Line {iid}: {verb} refused — {_explain(e)}")
-            return
+            await pending["run"](resolve)
         except Exception as e:  # noqa
-            await resolve(f"Line {iid}: {verb} failed — {e}")
+            log.exception("telegram: confirmed action failed: %r", e)
+            await resolve(f"Failed — {e}")
+
+    # ---------------- eSIM ----------------
+
+    def _reader_name(self, index: int) -> str:
+        for c in _routes().hub.cards_list():
+            if c.get("index") == index:
+                return c.get("name") or ""
+        return ""
+
+    async def _esim_ready(self, chat: str) -> bool:
+        """lpac is an optional local build; without it every LPA call 503s. Say so once."""
+        st = await _routes().api_esim_status()
+        if st.get("available"):
+            return True
+        await self.send(chat, "eSIM needs the local lpac build, which isn't installed.\n"
+                              "On the gateway: sudo ./install.sh build-lpac")
+        return False
+
+    def _target(self, chat: str) -> dict | None:
+        t = self._esim_target.get(chat)
+        if t and time.time() - t["ts"] < _ESIM_TARGET_TTL:
+            return t
+        self._esim_target.pop(chat, None)
+        return None
+
+    def _target_args(self, chat: str) -> dict:
+        t = self._target(chat) or {}
+        args = {"reader": t.get("reader"), "reader_index": t.get("index", 0)}
+        if t.get("se_id"):
+            args["se_id"] = t["se_id"]
+        return args
+
+    async def _esim_call(self, chat: str, describe: str, factory, resolve=None):
+        """Run one LPA operation and turn its two actionable failures into something the chat
+        can resolve: lpac missing, and a line holding the reader (which needs a stop first)."""
+        say = resolve or (lambda text: self.send(chat, text))
+        try:
+            return await factory(), True
+        except HTTPException as e:
+            detail = e.detail if isinstance(e.detail, str) else str(e.detail)
+            if e.status_code == 503:
+                await say("eSIM needs the local lpac build: sudo ./install.sh build-lpac")
+            elif e.status_code == 409 and "running on this reader" in detail:
+                await self._offer_stop_and_retry(chat, detail, describe, factory)
+            elif e.status_code == 409:
+                await say(f"{describe} not possible right now — {detail}")
+            elif e.status_code == 400 and "SE" in detail:
+                await say("This card has two eUICCs — run /esim first and pick one.")
+            else:
+                await say(f"{describe} failed — {_explain(e)}")
+        except Exception as e:  # noqa
+            await say(f"{describe} failed — {e}")
+        return None, False
+
+    async def _offer_stop_and_retry(self, chat: str, detail: str, describe: str, factory):
+        """lpac needs the card exclusively, so the most common eSIM failure is 'a line is using
+        this reader'. Handing that 409 to the user as-is would make them go and stop it by hand,
+        so offer the whole sequence — stop, retry, offer to start again — behind one button."""
+        m = re.search(r"Line (\S+) is running", detail)
+        iid = m.group(1) if m else None
+        if not iid:
+            await self.send(chat, detail)
             return
-        await resolve(f"Line {iid}: {verb} done.")
+
+        async def _do(resolve):
+            await resolve(f"Stopping line {iid}…")
+            try:
+                await _routes().api_instance_stop(iid)
+            except Exception as e:  # noqa
+                await resolve(f"Could not stop line {iid}: {e}")
+                return
+            await resolve(f"Line {iid} stopped. {describe}…")
+            _, ok = await self._esim_call(chat, describe, factory, resolve=resolve)
+            if ok:
+                await resolve(f"Line {iid} stopped, {describe} done.")
+            await self._ask(
+                chat, f"Start line {iid} again?",
+                lambda r: self._restart_line(r, iid), yes=f"Start line {iid}",
+                cancelled=f"Left line {iid} stopped.")
+
+        await self._ask(
+            chat,
+            f"Line {iid} is using this reader and lpac needs it exclusively.\n"
+            f"Stop line {iid} and {describe}?",
+            _do, yes=f"Stop line {iid} and continue",
+            cancelled=f"Cancelled — line {iid} left running.")
+
+    async def _restart_line(self, resolve, iid: str):
+        await resolve(f"Starting line {iid}…")
+        try:
+            await _routes().api_instance_start(iid, None)
+        except HTTPException as e:
+            await resolve(f"Line {iid} did not start — {_explain(e)}")
+            return
+        await resolve(f"Line {iid} started.")
+
+    async def _cmd_esim(self, chat: str, arg: str, _msg: dict):
+        """Pick the reader (and, on a dual-SE card, the eUICC) these commands act on."""
+        if not await self._esim_ready(chat):
+            return
+        cards = (await _routes().api_cards()).get("cards") or []
+        present = [c for c in cards if c.get("present")]
+        if not present:
+            await self.send(chat, "No card is present in any reader.")
+            return
+        if len(present) > 1 and not arg.strip():
+            await self.send(chat, "Which reader?", keyboard=[
+                [{"text": f"{c.get('index')}: {c.get('name')}",
+                  "callback_data": f"esr:{c.get('index')}"}] for c in present[:8]])
+            return
+        pick = present[0]
+        if arg.strip():
+            pick = next((c for c in present if str(c.get("index")) == arg.split()[0]), pick)
+        await self._select_reader(chat, pick.get("index"), pick.get("name"))
+
+    async def _select_reader(self, chat: str, index, name: str, resolve=None):
+        self._esim_target[chat] = {"reader": name, "index": index, "se_id": None,
+                                   "aid": None, "ts": time.time()}
+        say = resolve or (lambda text: self.send(chat, text))
+        payload, ok = await self._esim_call(
+            chat, "reading the chip",
+            lambda: _routes().api_esim_chip(reader_index=index, reader=name), resolve=resolve)
+        if not ok:
+            return
+        ses = payload.get("ses") or []
+        if payload.get("dual") and len(ses) > 1:
+            await self.send(chat, f"Reader {index} has two eUICCs — which one?", keyboard=[
+                [{"text": f"{se.get('label') or se.get('id')} · {se.get('eid') or 'no EID'}",
+                  "callback_data": f"ese:{se.get('id')}"}] for se in ses])
+            return
+        if ses:
+            self._esim_target[chat].update(se_id=ses[0].get("id"), aid=ses[0].get("aid"))
+        await say(_format_chip(index, name, payload))
+
+    async def _select_se(self, chat: str, se_id: str, resolve):
+        t = self._target(chat)
+        if not t:
+            await resolve("That selection expired — run /esim again.")
+            return
+        t.update(se_id=se_id, ts=time.time())
+        payload, ok = await self._esim_call(
+            chat, "reading the chip",
+            lambda: _routes().api_esim_chip(reader_index=t["index"], reader=t["reader"]),
+            resolve=resolve)
+        if not ok:
+            return
+        se = next((s for s in (payload.get("ses") or []) if s.get("id") == se_id), None)
+        if se:
+            t["aid"] = se.get("aid")
+        await resolve(_format_chip(t["index"], t["reader"], payload, only=se_id))
+
+    async def _need_target(self, chat: str) -> dict | None:
+        if not await self._esim_ready(chat):
+            return None
+        t = self._target(chat)
+        if not t:
+            await self.send(chat, "Pick a reader first with /esim.")
+            return None
+        return t
+
+    async def _cmd_esim_profiles(self, chat: str, _arg: str, _msg: dict):
+        t = await self._need_target(chat)
+        if not t:
+            return
+        payload, ok = await self._esim_call(
+            chat, "listing profiles",
+            lambda: _routes().api_esim_profiles(reader_index=t["index"], reader=t["reader"]))
+        if not ok:
+            return
+        await self.send(chat, _format_profiles(payload, t.get("se_id")))
+
+    async def _cmd_esim_notify(self, chat: str, _arg: str, _msg: dict):
+        t = await self._need_target(chat)
+        if not t:
+            return
+        payload, ok = await self._esim_call(
+            chat, "listing notifications",
+            lambda: _routes().api_esim_notifications(reader_index=t["index"],
+                                                     reader=t["reader"]))
+        if not ok:
+            return
+        rows = payload.get("notifications") or []
+        if not rows:
+            await self.send(chat, "No pending notifications.")
+            return
+        out = ["Pending notifications (/esim_notify_process <seq|all>)"]
+        for n in rows[:20]:
+            seq = n.get("seqNumber", n.get("seq"))
+            op = n.get("profileManagementOperation") or n.get("operation") or "notify"
+            out.append(f"#{seq} {op} {n.get('iccid') or '—'} "
+                       f"{n.get('notificationAddress') or n.get('address') or ''}".rstrip())
+        await self.send(chat, "\n".join(out))
+
+    async def _cmd_esim_notify_process(self, chat: str, arg: str, _msg: dict):
+        t = await self._need_target(chat)
+        if not t:
+            return
+        which = arg.split()[0] if arg.strip() else "all"
+        body = dict(self._target_args(chat), remove=True)
+        if which != "all":
+            try:
+                body["seq"] = int(which)
+            except ValueError:
+                await self.send(chat, "Usage: /esim_notify_process <seq|all>")
+                return
+        _, ok = await self._esim_call(
+            chat, "processing notifications",
+            lambda: _routes().api_esim_notifications_process(body))
+        if ok:
+            await self.send(chat, f"Processed {'all notifications' if which == 'all' else '#' + which}.")
+
+    async def _profile_op(self, chat: str, arg: str, verb: str, factory_for):
+        t = await self._need_target(chat)
+        if not t:
+            return
+        iccid = arg.split()[0] if arg.strip() else ""
+        if not iccid:
+            await self.send(chat, f"Usage: /esim_{verb} <iccid>  (/esim_profiles lists them)")
+            return
+
+        async def _do(resolve):
+            await resolve(f"{verb.capitalize()} {iccid}…")
+            _, ok = await self._esim_call(chat, f"{verb} of {iccid}",
+                                          factory_for(iccid), resolve=resolve)
+            if not ok:
+                return
+            await resolve(f"Profile {iccid} {verb}d.\n"
+                          "Switching profiles changes the card's ICCID, so a line bound to the "
+                          "old one will now refuse to start — provision the active profile as "
+                          "its own line. /status shows where each line stands.")
+
+        await self._ask(chat, f"{verb.capitalize()} profile {iccid} on reader {t['index']}?",
+                        _do, yes=f"Yes, {verb}", cancelled=f"Cancelled — {iccid} untouched.")
+
+    async def _cmd_esim_enable(self, chat: str, arg: str, _msg: dict):
+        await self._profile_op(chat, arg, "enable", lambda iccid: (
+            lambda: _routes().api_esim_enable(iccid, self._target_args(chat))))
+
+    async def _cmd_esim_disable(self, chat: str, arg: str, _msg: dict):
+        await self._profile_op(chat, arg, "disable", lambda iccid: (
+            lambda: _routes().api_esim_disable(iccid, self._target_args(chat))))
+
+    async def _cmd_esim_delete(self, chat: str, arg: str, _msg: dict):
+        """Deleting a profile is the one irreversible thing this bot can do — a downloaded
+        profile usually cannot be fetched again. A button is too easy to hit by accident, so
+        this one asks the operator to type part of the ICCID back."""
+        t = await self._need_target(chat)
+        if not t:
+            return
+        iccid = arg.split()[0] if arg.strip() else ""
+        if len(iccid) < 4:
+            await self.send(chat, "Usage: /esim_delete <iccid>  (/esim_profiles lists them)")
+            return
+        args = self._target_args(chat)
+
+        async def _run():
+            return await _routes().api_esim_delete(
+                iccid, reader_index=args.get("reader_index", 0), reader=args.get("reader"),
+                se_id=args.get("se_id"))
+
+        self._typed[chat] = {"expect": iccid[-4:], "iccid": iccid, "run": _run,
+                             "ts": time.time()}
+        await self.send(chat, f"This permanently deletes profile {iccid}. A deleted profile "
+                              f"usually cannot be downloaded again.\n"
+                              f"Type the last 4 digits ({'*' * (len(iccid) - 4)}____) to confirm, "
+                              f"or /cancel.")
+
+    async def _handle_typed_confirmation(self, chat: str, text: str) -> bool:
+        pending = self._typed.get(chat)
+        if not pending:
+            return False
+        if time.time() - pending["ts"] > _CONFIRM_TTL:
+            self._typed.pop(chat, None)
+            await self.send(chat, "That confirmation expired — run the command again.")
+            return True
+        if text.strip() == "/cancel":
+            self._typed.pop(chat, None)
+            await self.send(chat, "Cancelled — nothing was deleted.")
+            return True
+        if text.strip() != pending["expect"]:
+            self._typed.pop(chat, None)
+            await self.send(chat, "That doesn't match — nothing was deleted.")
+            return True
+        self._typed.pop(chat, None)
+        _, ok = await self._esim_call(chat, f"deleting {pending['iccid']}", pending["run"])
+        if ok:
+            await self.send(chat, f"Profile {pending['iccid']} deleted.")
+        return True
+
+    async def _cmd_esim_download(self, chat: str, arg: str, msg: dict):
+        # An activation code is single-use and worth stealing: whoever redeems it first gets
+        # the profile. Take it out of the chat history before doing anything with it.
+        await self.delete(chat, msg.get("message_id"))
+        code = arg.strip()
+        if not code:
+            await self.send(chat, "Usage: /esim_download LPA:1$smdp.example.com$MATCHINGID")
+            return
+        t = await self._need_target(chat)
+        if not t:
+            return
+        body = dict(self._target_args(chat), activation_code=code)
+        res, ok = await self._esim_call(
+            chat, "starting the download", lambda: _routes().api_esim_download(body))
+        if not ok:
+            return
+        mid = await self.send(chat, f"Download starting on reader {t['index']}…")
+        if mid:
+            self._downloads[res.get("reader") or t["reader"]] = {
+                "chat": chat, "message_id": mid, "last_edit": 0.0, "lines": []}
+
+    async def _on_download_event(self, msg: dict):
+        """One message per download, edited in place: a profile install emits dozens of steps
+        and posting each would bury the chat."""
+        track = self._downloads.get(msg.get("reader"))
+        if not track:
+            return
+        event, step = msg.get("event"), msg.get("step") or ""
+        if event == "preview":
+            meta = msg.get("metadata") or {}
+            name = meta.get("profileName") or meta.get("serviceProviderName") or "profile"
+            track["lines"].append(f"Found: {name} {meta.get('iccid') or ''}".rstrip())
+        elif event == "completed":
+            track["lines"].append("Installed.")
+        elif event == "error":
+            track["lines"].append(f"FAILED — {msg.get('error') or step or 'unknown'}")
+        elif event == "cancelling":
+            track["lines"].append("Cancelling…")
+        elif step:
+            track["lines"].append(step)
+        head = f"eSIM download on reader {msg.get('reader_index', '?')}"
+        body = "\n".join([head] + track["lines"][-8:])
+        terminal = event in ("completed", "error")
+        # Telegram rate-limits edits, and progress can arrive several times a second.
+        if not terminal and time.monotonic() - track["last_edit"] < 2.0:
+            return
+        track["last_edit"] = time.monotonic()
+        await self.edit(track["chat"], track["message_id"], body)
+        if terminal:
+            self._downloads.pop(msg.get("reader"), None)
+            if event == "completed":
+                await self.send(track["chat"],
+                                "The card's ICCID changed with the new profile, so any line "
+                                "bound to the old one will refuse to start until you provision "
+                                "the active profile as its own line.")
 
     # ---------------- dispatch ----------------
 
@@ -432,11 +820,22 @@ class TelegramBot:
         "/line_register": "_cmd_line_register", "/line_reprovision": "_cmd_line_reprovision",
         "/pin": "_cmd_pin",
     }
+    _ESIM_COMMANDS = {
+        "/esim": "_cmd_esim", "/esim_profiles": "_cmd_esim_profiles",
+        "/esim_enable": "_cmd_esim_enable", "/esim_disable": "_cmd_esim_disable",
+        "/esim_delete": "_cmd_esim_delete", "/esim_download": "_cmd_esim_download",
+        "/esim_notify": "_cmd_esim_notify",
+        "/esim_notify_process": "_cmd_esim_notify_process",
+    }
 
     async def _handle_message(self, msg: dict, commands: dict):
         chat = str(((msg.get("chat") or {}).get("id")) or "")
         text = (msg.get("text") or "").strip()
         if not text:
+            return
+
+        # A type-this-back confirmation owns the next message from this chat, whatever it is.
+        if await self._handle_typed_confirmation(chat, text):
             return
 
         # A plain reply to an incoming-SMS notification answers that conversation.
@@ -457,6 +856,12 @@ class TelegramBot:
                                       "(Settings -> Telegram -> allow line control).")
                 return
             handler = self._MANAGEMENT_COMMANDS[cmd]
+        if handler is None and cmd in self._ESIM_COMMANDS:
+            if not commands.get("allow_esim"):
+                await self.send(chat, "eSIM management is disabled for this bot "
+                                      "(Settings -> Telegram -> allow eSIM).")
+                return
+            handler = self._ESIM_COMMANDS[cmd]
         if not handler:
             if text.startswith("/"):
                 await self.send(chat, "Unknown command. /help lists what I understand.")
@@ -552,6 +957,55 @@ class TelegramBot:
                 await self._handle_update(update, tg, commands)
             except Exception as e:  # noqa
                 log.exception("telegram: update handling failed: %r", e)
+
+
+def _bytes(n) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    return f"{n / 1024:.0f} KB" if n < 1024 * 1024 else f"{n / 1024 / 1024:.1f} MB"
+
+
+def _profile_label(p: dict) -> str:
+    """Nickname first, then the operator's own name — matching what the WebUI shows."""
+    return ((p.get("profileNickname") or "").strip()
+            or (p.get("profileName") or "").strip()
+            or (p.get("serviceProviderName") or "").strip()
+            or "Profile")
+
+
+def _format_chip(index, name: str, payload: dict, only: str | None = None) -> str:
+    ses = [se for se in (payload.get("ses") or []) if not only or se.get("id") == only]
+    out = [f"Reader {index}: {name}"]
+    if payload.get("line_running"):
+        out.append(f"Line {payload.get('matched_instance')} is running on it — eSIM changes "
+                   f"need it stopped first (I'll offer to do that).")
+    for se in ses:
+        out.append(f"{se.get('label') or se.get('id')} · EID {se.get('eid') or '—'} · "
+                   f"{_bytes(se.get('freeSpace'))} free · "
+                   f"{len(se.get('profiles') or [])} profile(s)")
+    out.append("/esim_profiles to list them")
+    return "\n".join(out)
+
+
+def _format_profiles(payload: dict, only: str | None = None) -> str:
+    ses = [se for se in (payload.get("ses") or []) if not only or se.get("id") == only]
+    out = []
+    for se in ses:
+        profiles = se.get("profiles") or []
+        if len(ses) > 1:
+            out.append(f"— {se.get('label') or se.get('id')} —")
+        if not profiles:
+            out.append("(no profiles)")
+        for p in profiles:
+            enabled = str(p.get("profileState") or "").lower() == "enabled"
+            out.append(f"{'[on] ' if enabled else '[off] '}{_profile_label(p)}\n"
+                       f"      {p.get('iccid')}")
+    if not out:
+        return "No profiles on this card."
+    out.append("/esim_enable <iccid> · /esim_disable <iccid> · /esim_delete <iccid>")
+    return "\n".join(out)
 
 
 def _chat_allowed(tg: dict, chat_id) -> bool:

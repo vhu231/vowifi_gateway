@@ -254,6 +254,16 @@ export default function Settings() {
                 onChange={(e) => updTgCmd({ allow_management: e.target.checked })} />
               Also allow line control (start / stop / re-provision / PIN)
             </label>
+            <label style={{ display: 'block', marginTop: 8 }}>
+              <input type="checkbox" style={{ width: 'auto', marginRight: 8 }}
+                disabled={!tg.enabled || !tgc.enabled} checked={!!tgc.allow_esim}
+                onChange={(e) => updTgCmd({ allow_esim: e.target.checked })} />
+              Also allow eSIM management (switch, download, delete profiles)
+            </label>
+            <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginTop: 6, lineHeight: 1.5 }}>
+              Deleting a profile cannot be undone and a downloaded one usually cannot be
+              fetched again, so that command asks you to type part of the ICCID back.
+            </div>
             <div style={{ fontSize: 11.5, color: 'var(--text-mute)', marginTop: 6, lineHeight: 1.5 }}>
               A PIN sent in chat is deleted from the conversation as soon as it is read, but it
               still travels through Telegram — prefer entering it here in the WebUI.
