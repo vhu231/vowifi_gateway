@@ -70,6 +70,7 @@ export default function Settings({ instances = [] }) {
     const timer = setInterval(pull, building ? 2000 : 10000)
     return () => { alive = false; clearInterval(timer) }
   }, [building])
+  useEffect(() => { ubRef.current = ub }, [ub])
   if (!s) return <div style={{ color: 'var(--text-dim)' }}>Loading…</div>
 
   const upd = (patch) => setS((x) => ({ ...x, ...patch }))
@@ -100,7 +101,6 @@ export default function Settings({ instances = [] }) {
     ubRef.current = next
     return next
   })
-  React.useEffect(() => { ubRef.current = ub }, [ub])
   const refreshUb = () => api.userbot().then(setUbInfo).catch(() => {})
   const saveUb = async () => {
     try {
