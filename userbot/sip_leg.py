@@ -82,10 +82,24 @@ class _Call(pj.Call):
         super().__init__(acc, call_id)
         self._leg = leg
 
+    def _bind_audio(self):
+        """Join every active audio media on this call to the bridge port."""
+        info = self.getInfo()
+        for i, media in enumerate(info.media):
+            if (media.type == pj.PJMEDIA_TYPE_AUDIO
+                    and media.status == pj.PJSUA_CALL_MEDIA_ACTIVE):
+                self._leg._attach_media(self.getAudioMedia(i))
+
     def onCallState(self, prm):                              # noqa: ARG002
         info = self.getInfo()
         log.info("SIP call state: %s", info.stateText)
         if info.state == pj.PJSIP_INV_STATE_CONFIRMED:
+            # An answered inbound call renegotiates media on our own 200 OK, and
+            # onCallMediaState does not necessarily fire again for it. Binding
+            # once more here keeps the bridge port off the early media it
+            # attached to while ringing — whichever direction was left on the
+            # old session went silent for the rest of the call.
+            self._bind_audio()
             # The far end actually picked up. Media attaches earlier than this,
             # during ringback, so this is the only honest start of the call.
             self._leg._on_answered(self)
@@ -93,12 +107,7 @@ class _Call(pj.Call):
             self._leg._on_disconnected(self)
 
     def onCallMediaState(self, prm):                         # noqa: ARG002
-        info = self.getInfo()
-        for i, media in enumerate(info.media):
-            if (media.type == pj.PJMEDIA_TYPE_AUDIO
-                    and media.status == pj.PJSUA_CALL_MEDIA_ACTIVE):
-                audio = self.getAudioMedia(i)
-                self._leg._attach_media(audio)
+        self._bind_audio()
 
     def onDtmfDigit(self, prm):
         log.info("DTMF from the far end: %s", prm.digit)
@@ -288,7 +297,10 @@ class SipLeg:
     def answer(self):
         if not self._call:
             return
-        prm = pj.CallOpParam()
+        # CallOpParam(True), as dial() uses: the bare constructor zeroes the
+        # call settings, audioCount included, which is not what you want to
+        # answer a call with. The 180 above is fine bare — it carries no SDP.
+        prm = pj.CallOpParam(True)
         prm.statusCode = 200
         self._call.answer(prm)
         log.info("answered the SIP call")
