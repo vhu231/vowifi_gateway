@@ -114,36 +114,48 @@ class UserBot:
         us. It reads this file to show the sidecar in the WebUI."""
         return Path(self.cfg["session_name"]).parent / "status.json"
 
+    async def _write_status(self):
+        path = self._status_path()
+        try:
+            tg = self.bridge.tg if self.bridge else None
+            payload = {
+                "ts": int(time.time()),
+                "telegram_connected": bool(self.client.is_connected()),
+                "sip_registered": bool(self.sip and self.sip.registered),
+                "in_call": bool(tg and tg.active),
+                "owner_id": self.owner,
+                "sip_user": self.cfg.get("sip_user", ""),
+                "last_error": self.last_error,
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:  # noqa
+            log.debug("status write failed: %s", e)
+
     async def _report_status(self):
         """Rewrite status.json on a timer. The control plane treats a stale
         timestamp as 'not running' — we have no way to announce our own death,
         so a heartbeat is the signal."""
-        path = self._status_path()
         while True:
-            try:
-                tg = self.bridge.tg if self.bridge else None
-                payload = {
-                    "ts": int(time.time()),
-                    "telegram_connected": bool(self.client.is_connected()),
-                    "sip_registered": bool(self.sip and self.sip.registered),
-                    "in_call": bool(tg and tg.active),
-                    "owner_id": self.owner,
-                    "sip_user": self.cfg.get("sip_user", ""),
-                    "last_error": self.last_error,
-                }
-                path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(payload), encoding="utf-8")
-                tmp.replace(path)
-            except Exception as e:  # noqa
-                log.debug("status write failed: %s", e)
+            await self._write_status()
             await asyncio.sleep(5)
 
     def _may_dial(self, number: str) -> bool:
         return not self.allow or number in self.allow
 
     async def run(self):
-        await self.client.start(phone=self.cfg["phone"])
+        # Never client.start(phone=): that calls input() for the login code, and a
+        # detached container has no stdin (EOFError crash loop). Login happens in
+        # the WebUI; we only accept an already-authorized session.
+        await self.client.connect()
+        if not await self.client.is_user_authorized():
+            self.last_error = "not signed in — enter the login code in Settings"
+            log.error("%s", self.last_error)
+            await self._write_status()
+            await asyncio.sleep(300)
+            return
         me = await self.client.get_me()
         log.info("signed in as %s (id=%s)", me.first_name, me.id)
 

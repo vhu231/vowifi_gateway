@@ -96,6 +96,8 @@ export default function Settings({ instances = [] }) {
   const ubBox = ubInfo.container || {}
   const ubRunning = ubBox.state === 'running'
   const ubLogin = ubInfo.login || {}
+  const ubNeedLogin = ubLogin.pending || ubLogin.need_password || !ubInfo.signed_in
+    || (ubRunning && !(ubInfo.status || {}).running)
   const updUb = (patch) => setUb((x) => {
     const next = { ...x, ...patch }
     ubRef.current = next
@@ -135,7 +137,7 @@ export default function Settings({ instances = [] }) {
       login_code: ubCode,
       login_password: ubPassword,
     }),
-    ubRunning ? 'Restarting' : (ubLogin.pending || ubLogin.need_password ? 'Signing in' : 'Starting'),
+    ubRunning ? 'Restarting' : (ubNeedLogin ? 'Signing in' : 'Starting'),
   )
   const showUbLogs = async () => {
     if (ubLogs !== null) { setUbLogs(null); return }
@@ -460,7 +462,7 @@ export default function Settings({ instances = [] }) {
               placeholder="empty = any number" />
           </div>
 
-          {(ubLogin.pending || ubLogin.need_password || !ubInfo.signed_in) &&
+          {ubNeedLogin &&
             <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
               <div>
                 <label>Telegram login code</label>
@@ -480,7 +482,7 @@ export default function Settings({ instances = [] }) {
           <div style={{ marginTop: 14, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <button className="btn" onClick={saveUb} disabled={ubBusy}>Save</button>
             <button className="btn" disabled={ubBusy || building} onClick={startUb}>
-              {building ? 'Building…' : ubRunning ? 'Restart' : (ubLogin.pending || ubLogin.need_password ? 'Confirm & start' : 'Start')}
+              {building ? 'Building…' : ubRunning ? 'Restart' : (ubNeedLogin ? 'Confirm & start' : 'Start')}
             </button>
             {ubBox.exists &&
               <button className="btn btn-ghost" disabled={ubBusy}

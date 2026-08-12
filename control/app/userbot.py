@@ -204,39 +204,65 @@ def session_file() -> str | None:
     return os.path.join(_dir(), name[len(prefix):] + ".session")
 
 
-def signed_in() -> bool:
-    """Telethon asks for the login code on stdin. A detached container has no
-    stdin, so starting one without a cached session buys a crash loop rather than
-    a prompt — hence checking before we start it and not after.
+def _authorized_path() -> str:
+    return os.path.join(_dir(), "authorized")
 
-    Returning True when we cannot see the session path used to skip this check
-    entirely, which is the opposite of safe: a custom session_name off the
-    volume would look 'signed in' and then crash-loop in the container.
-    """
-    path = session_file()
-    if path and os.path.exists(path) and os.path.getsize(path) > 0:
-        return True
+
+def _mark_authorized(ok: bool) -> None:
+    """Telethon writes .session as soon as it connects to send a login code.
+    That file is not a completed login — only this marker is."""
+    os.makedirs(_dir(), exist_ok=True)
+    path = _authorized_path()
+    if ok:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("1\n")
+        return
     try:
-        for name in os.listdir(_dir()):
-            if name.endswith(".session") and os.path.getsize(os.path.join(_dir(), name)) > 0:
-                return True
+        os.remove(path)
     except FileNotFoundError:
         pass
-    return False
+
+
+def signed_in() -> bool:
+    """True only after a completed sign-in. A .session file from send_code is
+    not enough; treating it as signed-in hid the WebUI code box and started
+    the sidecar, which then crash-looped on input()."""
+    if os.path.isfile(_authorized_path()):
+        return True
+    login = _read_login()
+    if login.get("phone_code_hash") or login.get("need_password"):
+        return False
+    path = session_file()
+    if not (path and os.path.exists(path) and os.path.getsize(path) > 0):
+        return False
+    if TelegramClient is None:
+        return False
+    conf = load()
+
+    async def _check(client):
+        return bool(await client.is_user_authorized())
+
+    try:
+        ok = bool(_tg_run(_with_client(conf, _check)))
+    except Exception:
+        return False
+    if ok:
+        _mark_authorized(True)
+    return ok
 
 
 def snapshot() -> dict:
     login = _read_login()
-    pending = bool(login.get("phone_code_hash")) and not signed_in()
+    signed = signed_in()
     return {
         "config": public(),
         "status": status(),
         "container": container(),
-        "signed_in": signed_in(),
+        "signed_in": signed,
         "image_present": image_present(),
         "build": build_status(),
         "login": {
-            "pending": pending,
+            "pending": bool(login.get("phone_code_hash")) and not signed,
             "need_password": bool(login.get("need_password")),
             "phone": login.get("phone") or "",
         },
@@ -324,6 +350,7 @@ def send_login_code(force: bool = False) -> dict:
         raise NotReady(f"could not send the login code: {e}") from e
     _write_login({"phone": phone, "phone_code_hash": phone_code_hash,
                   "need_password": False, "ts": time.time()})
+    _mark_authorized(False)
     log.info("userbot login code sent to %s", phone)
     return {"ok": True, "phone": phone, "resent": True}
 
@@ -366,6 +393,7 @@ def confirm_login(code: str = "", password: str = "") -> dict:
     except Exception as e:
         raise NotReady(f"login failed: {e}") from e
     _clear_login()
+    _mark_authorized(True)
     log.info("userbot Telegram session saved under %s", _dir())
     return {"ok": True, "signed_in": True}
 
