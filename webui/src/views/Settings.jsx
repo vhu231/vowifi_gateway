@@ -448,11 +448,16 @@ export default function Settings({ instances = [] }) {
             incoming call ambiguous.
           </div>
           {ubCards.map((card, i) => (
+            // Wrapping flex, not a fixed grid: an inline grid template cannot be
+            // undone by the narrow-screen media query, and these cells have to
+            // stack on a phone. minWidth 0 is what lets them share the row
+            // evenly — an <input> defaults to size=20, and a flex item may not
+            // shrink below its intrinsic width without it, so the username box
+            // would sit wider than the selects beside it.
             <div key={i} style={{
-              display: 'grid', gap: 8, marginBottom: 8, alignItems: 'end',
-              gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) auto',
+              display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8, alignItems: 'end',
             }}>
-              <div><label>Line</label>
+              <div style={{ flex: '1 1 150px', minWidth: 0 }}><label>Line</label>
                 <select className="mono" value={card.line || ''}
                   onChange={(e) => updCard(i, { line: e.target.value })}>
                   <option value="">first configured line</option>
@@ -464,11 +469,11 @@ export default function Settings({ instances = [] }) {
                     </option>
                   ))}
                 </select></div>
-              <div><label>SIP username</label>
+              <div style={{ flex: '1 1 150px', minWidth: 0 }}><label>SIP username</label>
                 <input className="mono" value={card.sip_user || ''}
                   onChange={(e) => updCard(i, { sip_user: e.target.value })}
                   placeholder={`tgbridge${card.line || ''}`} /></div>
-              <div><label>Answered by</label>
+              <div style={{ flex: '1 1 150px', minWidth: 0 }}><label>Answered by</label>
                 <select className="mono" value={String(card.answer_owner || 0)}
                   onChange={(e) => updCard(i, { answer_owner: Number(e.target.value) })}>
                   <option value="0">{`you (${ub.owner_id || 'primary'})`}</option>
@@ -476,7 +481,7 @@ export default function Settings({ instances = [] }) {
                     <option key={o} value={String(o)}>{o}</option>
                   ))}
                 </select></div>
-              <button className="btn btn-ghost" type="button"
+              <button className="btn btn-ghost" type="button" style={{ flex: '0 0 auto' }}
                 onClick={() => updUb({ cards: ubCards.filter((_, j) => j !== i) })}>Remove</button>
             </div>
           ))}
