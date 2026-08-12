@@ -25,14 +25,35 @@ Inbound (someone dials a SIM):
 Teardown is the subtle half. A Telegram call that never joined a SIP leg must
 leave a ringing inbound call alone: declining on Telegram used to hang the
 caller up after a single ring and silence every other extension with it.
+
+Whatever the outcome, whoever was on the call gets a summary afterwards. For a
+call nobody took that is the only trace the SIM rang at all.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from functools import partial
 
 log = logging.getLogger("userbot.bridge")
+
+
+def _span(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m {total % 60:02d}s"
+    return f"{total // 3600}h {total % 3600 // 60:02d}m"
+
+
+def _caller_number(uri: str) -> str:
+    """`"Someone" <sip:+85312345@ims.example>` -> `+85312345`."""
+    text = str(uri or "")
+    if "sip:" in text:
+        text = text.split("sip:", 1)[1].split("@", 1)[0]
+    return text.strip("<> ") or "unknown"
 
 
 class CallBridge:
@@ -46,6 +67,8 @@ class CallBridge:
         self._active = None
         self._pending_outbound: tuple[str, str] | None = None   # (line, number)
         self._inbound: tuple[str, str] | None = None            # (line, caller)
+        # What the current attempt is, so it can be reported once it is over.
+        self._session: dict | None = None
         self._tearing_down = False
 
         self.tg.on_pcm = self._tg_to_sip
@@ -54,6 +77,7 @@ class CallBridge:
         for line, leg in self.legs.items():
             leg.on_pcm = partial(self._sip_to_tg, line)
             leg.on_incoming = partial(self._sip_incoming, line)
+            leg.on_answered = partial(self._sip_answered, line)
             leg.on_ended = partial(self._sip_ended, line)
 
     # ---------- audio ----------
@@ -93,6 +117,8 @@ class CallBridge:
         if not leg.registered:
             return f"Line {line} is not registered with the gateway right now."
         self._pending_outbound = (line, number)
+        self._session = {"direction": "out", "line": line, "number": number,
+                         "who": caller, "started": time.time(), "answered": None}
         log.info("outbound: ringing %s before dialling %s on line %s", caller, number, line)
         try:
             ringing = await self.tg.place_call(caller)
@@ -120,6 +146,8 @@ class CallBridge:
             return
         log.info("line %s: call from %s — ringing %s on Telegram", line, peer, who)
         self._inbound = (line, peer)
+        self._session = {"direction": "in", "line": line, "number": _caller_number(peer),
+                         "who": who, "started": time.time(), "answered": None}
         try:
             ringing = await self.tg.place_call(who)
         except Exception:
@@ -146,6 +174,8 @@ class CallBridge:
                 await self.tg.hangup()
                 return
             self._active = leg
+            if self._session:
+                self._session["bridged"] = True
             return
         if self._inbound:
             (line, _peer), self._inbound = self._inbound, None
@@ -153,11 +183,21 @@ class CallBridge:
             if leg is not None:
                 leg.answer()
                 self._active = leg
+                if self._session:
+                    self._session["bridged"] = True
+
+    def _sip_answered(self, line: str):
+        """The far end picked up — the only honest start of the conversation."""
+        if self.legs.get(line) is not self._active:
+            return
+        if self._session and not self._session["answered"]:
+            self._session["answered"] = time.time()
 
     async def _tg_ended(self):
         if self._tearing_down:
             return
         self._tearing_down = True
+        session, self._session = self._session, None
         try:
             self._pending_outbound = None
             inbound, self._inbound = self._inbound, None
@@ -172,6 +212,40 @@ class CallBridge:
                          inbound[0])
         finally:
             self._tearing_down = False
+        if session:
+            await self._report(session)
+
+    # ---------- call summary ----------
+
+    @staticmethod
+    def _summary(session: dict) -> str:
+        began = time.strftime("%H:%M:%S", time.localtime(session["started"]))
+        way = "outgoing" if session["direction"] == "out" else "incoming"
+        head = f"{session['number']} · {way} · line {session['line']}"
+        answered = session["answered"]
+        if answered:
+            return (f"Call ended\n{head}\n"
+                    f"Started {began}, connected after {_span(answered - session['started'])}\n"
+                    f"Talked for {_span(time.time() - answered)}")
+        rang = _span(time.time() - session["started"])
+        if not session.get("bridged"):
+            # Never reached the SIM at all, which reads very differently from
+            # the far end letting it ring.
+            missed = ("you did not pick up, so I never dialled"
+                      if session["direction"] == "out" else "nobody took it here")
+            return f"Not connected\n{head}\nRang at {began} for {rang} — {missed}"
+        return f"No answer\n{head}\nRang at {began} for {rang}"
+
+    async def _report(self, session: dict):
+        """Tell whoever was on the call how it went. A missed inbound call is
+        worth saying too — it is the only trace the SIM rang at all."""
+        who = session.get("who")
+        if not who:
+            return
+        try:
+            await self.tg.client.send_message(who, self._summary(session))
+        except Exception as e:  # noqa
+            log.warning("could not send the call summary: %s", e)
 
     def _sip_ended(self, line: str):
         leg = self.legs.get(line)

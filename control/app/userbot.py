@@ -855,6 +855,13 @@ def start_container() -> str:
         pass
     _clear_status()
 
+    volumes = {host_dir: {"bind": "/data/userbot", "mode": "rw"}}
+    # Match the host clock. The sidecar timestamps its own log and the call
+    # summaries it sends the owner, and a container that quietly runs on UTC
+    # makes both of those read as somebody else's day.
+    if os.path.exists("/etc/localtime"):
+        volumes["/etc/localtime"] = {"bind": "/etc/localtime", "mode": "ro"}
+
     c = client.containers.run(
         IMAGE,
         name=CONTAINER,
@@ -862,7 +869,7 @@ def start_container() -> str:
         # The SIP leg registers to the engine's port on the host and receives RTP
         # on whatever port PJSIP picks, so published ports are not workable.
         network_mode="host",
-        volumes={host_dir: {"bind": "/data/userbot", "mode": "rw"}},
+        volumes=volumes,
         restart_policy={"Name": "unless-stopped"},
     )
     log.info("started userbot container %s", c.name)

@@ -85,7 +85,11 @@ class _Call(pj.Call):
     def onCallState(self, prm):                              # noqa: ARG002
         info = self.getInfo()
         log.info("SIP call state: %s", info.stateText)
-        if info.state == pj.PJSIP_INV_STATE_DISCONNECTED:
+        if info.state == pj.PJSIP_INV_STATE_CONFIRMED:
+            # The far end actually picked up. Media attaches earlier than this,
+            # during ringback, so this is the only honest start of the call.
+            self._leg._on_answered(self)
+        elif info.state == pj.PJSIP_INV_STATE_DISCONNECTED:
             self._leg._on_disconnected(self)
 
     def onCallMediaState(self, prm):                         # noqa: ARG002
@@ -177,6 +181,7 @@ class SipLeg:
       on_pcm(bytes)      - audio from the gateway (48 kHz mono int16)
       on_incoming(peer)  - an inbound call is ringing; answer() to take it
       on_connected()     - media is up
+      on_answered()      - the far end picked up (later than on_connected)
       on_ended()         - the SIP call is gone
     """
 
@@ -186,6 +191,7 @@ class SipLeg:
         self.on_pcm = None
         self.on_incoming = None
         self.on_connected = None
+        self.on_answered = None
         self.on_ended = None
 
         self._ep: pj.Endpoint | None = None
@@ -296,6 +302,11 @@ class SipLeg:
             self._call.hangup(pj.CallOpParam())
         except Exception as e:  # noqa
             log.debug("SIP hangup: %s", e)
+
+    def _on_answered(self, call):
+        if call is not self._call or not self.on_answered:
+            return
+        self.on_answered()
 
     def _on_disconnected(self, call):
         if call is not self._call:
