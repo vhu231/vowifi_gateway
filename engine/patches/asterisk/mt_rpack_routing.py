@@ -1,6 +1,6 @@
 import re, sys
 
-# PATCH_RPACK_ROUTING2: fix MT (mobile-terminated) SMS RP-ACK so the carrier accepts it.
+# PATCH_RPACK_ROUTING3: fix MT (mobile-terminated) SMS RP-ACK so the carrier accepts it.
 #
 # The stock sysmocom send_rpack() sends the RP-ACK to endpoint->smsc_uri and lets PJSIP
 # resolve/open a transport. Against a real ePDG this fails several ways (all verified on live
@@ -11,21 +11,36 @@ import re, sys
 #   2. EADDRINUSE (120098): with a raw-IP request-URI, PJSIP opens a NEW connection from the
 #      IMS local port, colliding with the registered IMS socket. Must pin the tdata to the
 #      transport the SMS arrived on (pjsip_tx_data_set_transport) so it reuses the open socket.
-#   3. FQDN P-Asserted-Identity (EE UK and similar): the SMSC identity is an IMS-INTERNAL FQDN
-#      (e.g. smg101wvn.ims.mnc030.mcc234.3gppnetwork.org) that only resolves inside the carrier
-#      IMS -> NXDOMAIN on our resolver. PJSIP tries to DNS-resolve the request-URI host BEFORE
-#      the pinned transport can carry it, resolution fails, and the RP-ACK is NEVER transmitted
-#      -> no delivery confirmation -> the SMSC re-pushes the unacked backlog on every new inbound
-#      (the "same SMS repeats" symptom). Fix: when the PAI host is NOT an IP literal, pre-seed
-#      tdata->dest_info with the arrival transport's connected peer (the P-CSCF) so
-#      pjsip_endpt_send_request skips DNS entirely and sends the RP-ACK back on the incoming IMS
-#      link to the P-CSCF, which then loose-routes it onward to the SMSC -- exactly how a native
-#      UE writes the RP-ACK back. Raw-IP PAIs (Telus) keep the existing path untouched.
+#   3. FQDN P-Asserted-Identity (EE UK, CTExcel UK and similar): the SMSC identity is an
+#      IMS-INTERNAL FQDN (e.g. smg102cro.ims.mnc030.mcc234.3gppnetwork.org) that only resolves
+#      inside the carrier IMS. Asterisk's res_pjsip resolver queries it for real -- and only for
+#      AAAA when the IMS transport is IPv6 -- and logs "Resolution completed - 0 viable targets",
+#      so the RP-ACK is NEVER transmitted -> no delivery confirmation -> the SMSC re-pushes the
+#      unacked backlog on every new inbound (the "same SMS repeats" symptom).
+#
+#      PATCH_RPACK_ROUTING2 tried to fix this by pre-seeding tdata->dest_info with the arrival
+#      transport's peer. That does not work: ast_sip_send_request() sends STATEFULLY
+#      (pjsip_endpt_send_request -> UAC transaction) and the transaction picks its destination
+#      with pjsip_get_request_dest(), which consults ONLY the topmost TYPED Route header
+#      (pjsip_msg_find_hdr(.., PJSIP_H_ROUTE, ..)) and otherwise falls back to the request-URI;
+#      tdata->dest_info is ignored on that path. Worse, the Service-Route entries this function
+#      adds go in through ast_sip_add_header(), which builds a pjsip_generic_string_hdr
+#      (PJSIP_H_OTHER) whose name merely reads "Route" -- invisible to that typed lookup. So the
+#      RP-ACK was never actually loose-routed at all; PJSIP always routed it by request-URI, i.e.
+#      by the unresolvable SMSC FQDN. Telus only ever worked because its PAI is a raw IP.
+#
+#      Fix (v3): when the PAI host is NOT an IP literal, insert a REAL typed Route header
+#      (ast_sip_set_outbound_proxy) pointing at the P-CSCF -- the connected peer of the transport
+#      the SMS arrived on, always an IP literal handed to us by the ePDG. pjsip_get_request_dest()
+#      then returns that IP ("Target is an IP address, skipping resolution"), the request-URI
+#      stays the SMSC PAI, and the RP-ACK goes back on the incoming IMS link to the P-CSCF, which
+#      loose-routes it onward to the SMSC -- exactly how a native UE writes the RP-ACK back.
+#      Raw-IP PAIs (Telus) keep the existing path untouched.
 # With these fixes the carrier returns 200 OK / 202 Accepted and stops re-pushing the queue.
 
 FIXED_FN = r'''static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char ack_ref)
 {
-	/* PATCH_RPACK_ROUTING2 */
+	/* PATCH_RPACK_ROUTING3 */
 	pj_status_t status;
 	char buf[7];
 	char pai_buf[512];
@@ -95,13 +110,18 @@ FIXED_FN = r'''static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char
 		pjsip_tx_data_set_transport(tdata, &tp_sel);
 	}
 
-	/* If the SMSC identity (P-Asserted-Identity) is an FQDN (IMS-internal, unresolvable on our
-	 * resolver -> NXDOMAIN), do NOT let PJSIP DNS-resolve the request-URI host: that fails and the
-	 * RP-ACK never leaves, so the SMSC re-pushes the unacked backlog on every new inbound (the
-	 * "same SMS repeats" bug). Instead pre-seed tdata->dest_info with the arrival transport's
-	 * connected peer (the P-CSCF) so pjsip_endpt_send_request skips resolution and sends the RP-ACK
-	 * back on the incoming IMS link to the P-CSCF, which loose-routes it onward to the SMSC --
-	 * exactly how a native UE writes the RP-ACK back. Raw-IP PAIs (e.g. Telus) are left untouched. */
+	/* If the SMSC identity (P-Asserted-Identity) is an FQDN it is IMS-internal and does not
+	 * resolve on our resolver -- res_pjsip logs "Resolution completed - 0 viable targets" and the
+	 * RP-ACK is never transmitted, so the SMSC re-pushes the unacked backlog on every new inbound
+	 * (the "same SMS repeats" bug). The destination of a stateful send is chosen by
+	 * pjsip_get_request_dest(), which looks at the topmost TYPED Route header and otherwise falls
+	 * back to the request-URI; tdata->dest_info is NOT consulted there, and the Service-Route
+	 * entries added below are generic string headers (PJSIP_H_OTHER) that the typed lookup cannot
+	 * see. So insert a real Route header pointing at the P-CSCF -- the connected peer of the
+	 * transport this SMS arrived on, always an IP literal -- and PJSIP skips resolution entirely
+	 * and writes the RP-ACK back on the incoming IMS link, which loose-routes it onward to the
+	 * SMSC, exactly how a native UE does it. The request-URI stays the SMSC PAI. Raw-IP PAIs
+	 * (e.g. Telus) are left on the previously verified path, untouched. */
 	{
 		pj_bool_t pai_is_ip = PJ_FALSE;
 		pjsip_uri *pu = pjsip_parse_uri(tdata->pool, (char *)base_uri,
@@ -113,6 +133,23 @@ FIXED_FN = r'''static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char
 		}
 		if (!pai_is_ip && rdata->tp_info.transport) {
 			pjsip_transport *itp = rdata->tp_info.transport;
+			char pcscf[PJ_INET6_ADDRSTRLEN + 16];
+			char proxy[PJ_INET6_ADDRSTRLEN + 64];
+
+			/* flags 1|2 = append ":port" and bracket an IPv6 literal -> "[2a01:..::1]:5063" */
+			if (pj_sockaddr_print(&itp->key.rem_addr, pcscf, sizeof(pcscf), 3)) {
+				snprintf(proxy, sizeof(proxy), "sip:%s;lr;transport=tcp", pcscf);
+				if (ast_sip_set_outbound_proxy(tdata, proxy)) {
+					ast_log(LOG_WARNING, "PJSIP MESSAGE - RP-ACK: could not route "
+						"via P-CSCF %s\n", proxy);
+				} else {
+					ast_debug(2, "RP-ACK for FQDN SMSC '%s' routed via P-CSCF %s "
+						"(no DNS)\n", base_uri, proxy);
+				}
+			}
+
+			/* Belt and braces for any path that ends up sending statelessly: pre-resolve to
+			 * the same peer so no resolver call can creep back in. */
 			tdata->dest_info.name = itp->remote_name.host;
 			tdata->dest_info.cur_addr = 0;
 			tdata->dest_info.addr.count = 1;
@@ -182,7 +219,7 @@ FIXED_FN = r'''static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char
 
 f = '/home/asterisk-build/asterisk/res/res_pjsip_messaging.c'
 s = open(f).read()
-if 'PATCH_RPACK_ROUTING2' in s:
+if 'PATCH_RPACK_ROUTING3' in s:
     print("already patched"); sys.exit(0)
 
 start = s.find('static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char ack_ref)')
