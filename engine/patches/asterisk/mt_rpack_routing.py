@@ -1,6 +1,6 @@
 import re, sys
 
-# PATCH_RPACK_ROUTING3: fix MT (mobile-terminated) SMS RP-ACK so the carrier accepts it.
+# PATCH_RPACK_ROUTING4: fix MT (mobile-terminated) SMS RP-ACK so the carrier accepts it.
 #
 # The stock sysmocom send_rpack() sends the RP-ACK to endpoint->smsc_uri and lets PJSIP
 # resolve/open a transport. Against a real ePDG this fails several ways (all verified on live
@@ -36,11 +36,26 @@ import re, sys
 #      stays the SMSC PAI, and the RP-ACK goes back on the incoming IMS link to the P-CSCF, which
 #      loose-routes it onward to the SMSC -- exactly how a native UE writes the RP-ACK back.
 #      Raw-IP PAIs (Telus) keep the existing path untouched.
+#   4. Two bugs that made 3. a no-op on some hosts (both fixed here, v4):
+#      a. The "is the PAI host an IP literal?" test used pj_sockaddr_parse(). That function is NOT
+#         a pure parser: for a non-numeric host it falls through to pj_sockaddr_init() ->
+#         pj_gethostbyname(), i.e. a real DNS lookup. On a host whose resolver answers every name
+#         (a fake-IP resolver, a wildcard/captive DNS, a search-domain that always matches) the
+#         lookup SUCCEEDS, the FQDN is misclassified as an IP literal, and the entire FQDN branch
+#         is skipped -- silently, with no log line. Use pj_inet_pton() instead: numeric-only, no
+#         resolver involvement, which is what "is this an IP literal" actually means.
+#      b. The Route value was built without angle brackets ("sip:host;lr"). RFC 3261 wants
+#         name-addr for Route, and in addr-spec form pjsip_parse_hdr() binds ";lr" as a HEADER
+#         parameter, not a URI parameter -- so sip_uri->lr_param stays 0 and pjsip_get_request_dest()
+#         takes the STRICT-routing branch, swapping the request-URI. Emit "<sip:host;lr>" so lr
+#         lands on the URI and loose routing applies.
+#      The confirmation lines are LOG_NOTICE (one per inbound SMS) rather than ast_debug so this
+#      path can be verified without turning Asterisk debug up.
 # With these fixes the carrier returns 200 OK / 202 Accepted and stops re-pushing the queue.
 
 FIXED_FN = r'''static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char ack_ref)
 {
-	/* PATCH_RPACK_ROUTING3 */
+	/* PATCH_RPACK_ROUTING4 */
 	pj_status_t status;
 	char buf[7];
 	char pai_buf[512];
@@ -128,24 +143,44 @@ FIXED_FN = r'''static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char
 			strlen(base_uri), 0);
 		if (pu && (PJSIP_URI_SCHEME_IS_SIP(pu) || PJSIP_URI_SCHEME_IS_SIPS(pu))) {
 			pjsip_sip_uri *su = (pjsip_sip_uri *)pjsip_uri_get_uri(pu);
-			pj_sockaddr tmp;
-			pai_is_ip = (pj_sockaddr_parse(pj_AF_UNSPEC(), 0, &su->host, &tmp) == PJ_SUCCESS);
+			pj_str_t h = su->host;
+			pj_in_addr v4;
+			pj_in6_addr v6;
+
+			/* An IPv6 literal may still carry its brackets here; pj_inet_pton wants it bare. */
+			if (h.slen >= 2 && h.ptr[0] == '[' && h.ptr[h.slen - 1] == ']') {
+				h.ptr++;
+				h.slen -= 2;
+			}
+			/* pj_inet_pton is numeric-only. Do NOT use pj_sockaddr_parse here: it resolves
+			 * non-numeric hosts via pj_gethostbyname, so a wildcard/fake-IP resolver makes
+			 * every FQDN look like an IP literal and silently disables this whole branch. */
+			if (h.slen > 0) {
+				pai_is_ip = (pj_inet_pton(pj_AF_INET(), &h, &v4) == PJ_SUCCESS) ||
+					(pj_inet_pton(pj_AF_INET6(), &h, &v6) == PJ_SUCCESS);
+			}
 		}
 		if (!pai_is_ip && rdata->tp_info.transport) {
 			pjsip_transport *itp = rdata->tp_info.transport;
 			char pcscf[PJ_INET6_ADDRSTRLEN + 16];
 			char proxy[PJ_INET6_ADDRSTRLEN + 64];
 
-			/* flags 1|2 = append ":port" and bracket an IPv6 literal -> "[2a01:..::1]:5063" */
+			/* flags 1|2 = append ":port" and bracket an IPv6 literal -> "[2a01:..::1]:5063".
+			 * Angle brackets are required: in addr-spec form pjsip binds ";lr" as a header
+			 * parameter, leaving lr_param unset and sending us down the strict-routing path. */
 			if (pj_sockaddr_print(&itp->key.rem_addr, pcscf, sizeof(pcscf), 3)) {
-				snprintf(proxy, sizeof(proxy), "sip:%s;lr;transport=tcp", pcscf);
+				snprintf(proxy, sizeof(proxy), "<sip:%s;lr;transport=tcp>", pcscf);
 				if (ast_sip_set_outbound_proxy(tdata, proxy)) {
-					ast_log(LOG_WARNING, "PJSIP MESSAGE - RP-ACK: could not route "
-						"via P-CSCF %s\n", proxy);
+					ast_log(LOG_WARNING, "RP-ACK: could not build P-CSCF route %s "
+						"for FQDN SMSC '%s' -- delivery confirmation will not "
+						"reach the SMSC\n", proxy, base_uri);
 				} else {
-					ast_debug(2, "RP-ACK for FQDN SMSC '%s' routed via P-CSCF %s "
-						"(no DNS)\n", base_uri, proxy);
+					ast_log(LOG_NOTICE, "RP-ACK for FQDN SMSC '%s' routed via "
+						"P-CSCF %s (DNS bypassed)\n", base_uri, proxy);
 				}
+			} else {
+				ast_log(LOG_WARNING, "RP-ACK: could not read the P-CSCF address off the "
+					"arrival transport for FQDN SMSC '%s'\n", base_uri);
 			}
 
 			/* Belt and braces for any path that ends up sending statelessly: pre-resolve to
@@ -158,6 +193,9 @@ FIXED_FN = r'''static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char
 			tdata->dest_info.addr.entry[0].weight = 0;
 			pj_sockaddr_cp(&tdata->dest_info.addr.entry[0].addr, &itp->key.rem_addr);
 			tdata->dest_info.addr.entry[0].addr_len = itp->addr_len;
+		} else if (pai_is_ip) {
+			ast_log(LOG_NOTICE, "RP-ACK: SMSC identity '%s' is an IP literal; using the "
+				"pinned-transport path\n", base_uri);
 		}
 	}
 
@@ -219,7 +257,7 @@ FIXED_FN = r'''static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char
 
 f = '/home/asterisk-build/asterisk/res/res_pjsip_messaging.c'
 s = open(f).read()
-if 'PATCH_RPACK_ROUTING3' in s:
+if 'PATCH_RPACK_ROUTING4' in s:
     print("already patched"); sys.exit(0)
 
 start = s.find('static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char ack_ref)')
